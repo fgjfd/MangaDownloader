@@ -18,6 +18,12 @@ BROWSER_PATHS = {
 
 DEFAULT_SITE = '拷贝漫画'
 
+SITES_REQUIRING_LOGIN = ['快看', '腾讯动漫', '菠萝包']
+
+DEFAULT_COOKIES_DIR = 'cookies'
+
+CONFIG_FILE = 'config.json'
+
 SITES = {
     '快看': {
         'site_url': 'https://www.kuaikanmanhua.com/',
@@ -75,5 +81,19 @@ SITES = {
         },
         'image_attr': 'src',
         'chapter_group_size': None
+    },
+    '菠萝包': {
+        'site_url': 'https://www.sfacg.com/',
+        'locators': {
+            'search_input': '@tag()=input',
+            'search_button': 'xpath:/html/body/div[1]/div[2]/div/div[1]/div[1]/span',
+            'search_result': 'xpath:/html/body/form/table[5]/tbody/tr/td/ul/li[2]/strong/a',
+            'cover_image': 'xpath:/html/body/div[2]/div[3]/ul[2]/li[1]/img',
+            'chapter_list': 'xpath:/html/body/div[3]/div[1]/div[3]/div[1]/a',
+            'chapter_link': 'xpath:/html/body/div[3]/div[1]/div[3]/div[1]/a[num]'
+        },
+        'image_attr': 'src',
+        'chapter_group_size': None,
+        'api_mode': True
     }
 }

@@ -5,10 +5,11 @@ import threading
 import asyncio
 import os
 import time
+import json
 from crawler import ComicCrawler
 from downloader import download_cover_image, download_all_chapters
 from utils import zip_main_folder
-from config import SITES, DEFAULT_SITE, BROWSER_PATHS
+from config import SITES, DEFAULT_SITE, BROWSER_PATHS, SITES_REQUIRING_LOGIN, DEFAULT_COOKIES_DIR, CONFIG_FILE
 
 
 class GenericComicDownloaderGUI:
@@ -18,7 +19,10 @@ class GenericComicDownloaderGUI:
         self.root.geometry("900x700")
         self.root.resizable(True, True)
         
-        # 创建主画布和滚动条
+        self.crawler = None
+        self.login_window_open = False
+        self.cookies_dir = self.load_config().get('cookies_dir', DEFAULT_COOKIES_DIR)
+        
         self.canvas = tk.Canvas(root, highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
@@ -26,25 +30,20 @@ class GenericComicDownloaderGUI:
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
         
-        # 创建内部Frame
         self.main_frame = ttk.Frame(self.canvas, padding="10")
         
-        # 在Canvas中创建窗口，固定宽度避免抖动
         self.canvas_window = self.canvas.create_window((0, 0), window=self.main_frame, anchor="nw", width=860)
         
-        # 绑定配置事件更新滚动区域和窗口宽度
         def on_frame_configure(event=None):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         
         def on_canvas_configure(event=None):
-            # Canvas大小改变时，更新内部窗口宽度
             canvas_width = event.width
             self.canvas.itemconfig(self.canvas_window, width=canvas_width)
         
         self.main_frame.bind("<Configure>", on_frame_configure)
         self.canvas.bind("<Configure>", on_canvas_configure)
         
-        # 绑定鼠标滚轮
         def on_mousewheel(event):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         self.canvas.bind_all("<MouseWheel>", on_mousewheel)
@@ -109,32 +108,87 @@ class GenericComicDownloaderGUI:
         
         ttk.Label(self.num_frame, text="(结束填0表示到最后一章)").pack(side=tk.LEFT, padx=5)
         
-        self.cookie_frame = ttk.Frame(self.main_frame)
+        self.comic_id_frame = ttk.Frame(self.main_frame)
         
-        ttk.Label(self.cookie_frame, text="Cookie:", width=10).pack(side=tk.LEFT, padx=5)
-        
-        cookie_input_frame = ttk.Frame(self.cookie_frame)
-        cookie_input_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        self.cookie_text = tk.Text(
-            cookie_input_frame, 
-            font=("微软雅黑", 9),
-            height=2,
-            wrap=tk.CHAR
+        self.use_comic_id_var = tk.BooleanVar(value=False)
+        self.use_comic_id_check = ttk.Checkbutton(
+            self.comic_id_frame,
+            text="使用漫画ID",
+            variable=self.use_comic_id_var,
+            command=self.on_comic_id_check_change
         )
-        self.cookie_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.use_comic_id_check.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.comic_id_frame, text="漫画ID:", width=8).pack(side=tk.LEFT, padx=5)
+        self.comic_id_var = tk.StringVar()
+        self.comic_id_entry = ttk.Entry(
+            self.comic_id_frame,
+            textvariable=self.comic_id_var,
+            font=("微软雅黑", 10),
+            width=15,
+            state=tk.DISABLED
+        )
+        self.comic_id_entry.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.comic_id_frame, text="(腾讯动漫可直接输入ID，如: 544298)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=5)
+        
+        self.login_frame = ttk.Frame(self.main_frame)
+        
+        self.login_var = tk.BooleanVar(value=False)
+        self.login_check = ttk.Checkbutton(
+            self.login_frame,
+            text="需要登录账号",
+            variable=self.login_var,
+            command=self.on_login_check_change
+        )
+        self.login_check.pack(side=tk.LEFT, padx=5)
+        
+        self.login_status_label = ttk.Label(
+            self.login_frame,
+            text="",
+            font=("微软雅黑", 9)
+        )
+        self.login_status_label.pack(side=tk.LEFT, padx=5)
+        
+        self.login_button = ttk.Button(
+            self.login_frame,
+            text="打开登录页面",
+            command=self.open_login_page,
+            width=12
+        )
+        self.login_button.pack(side=tk.LEFT, padx=5)
+        
+        self.login_complete_button = ttk.Button(
+            self.login_frame,
+            text="登录完成",
+            command=self.complete_login,
+            width=10,
+            state=tk.DISABLED
+        )
+        self.login_complete_button.pack(side=tk.LEFT, padx=5)
+        
+        self.cookies_path_frame = ttk.Frame(self.main_frame)
+        
+        ttk.Label(self.cookies_path_frame, text="Cookies路径:", width=10).pack(side=tk.LEFT, padx=5)
+        self.cookies_path_var = tk.StringVar(value=self.cookies_dir)
+        self.cookies_path_entry = ttk.Entry(
+            self.cookies_path_frame,
+            textvariable=self.cookies_path_var,
+            font=("微软雅黑", 10)
+        )
+        self.cookies_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         ttk.Button(
-            cookie_input_frame,
-            text="从文件加载",
-            command=self.load_cookie_from_file,
-            width=10
+            self.cookies_path_frame,
+            text="浏览",
+            command=self.browse_cookies_path,
+            width=8
         ).pack(side=tk.LEFT, padx=5)
         
         self.thread_frame = ttk.Frame(self.main_frame)
         
-        ttk.Label(self.thread_frame, text="章节收集线程数:", width=14).pack(side=tk.LEFT, padx=5)
-        self.thread_var = tk.StringVar(value="10")
+        ttk.Label(self.thread_frame, text="同时打开标签页数:", width=14).pack(side=tk.LEFT, padx=5)
+        self.thread_var = tk.StringVar(value="5")
         self.thread_entry = ttk.Entry(
             self.thread_frame, 
             textvariable=self.thread_var, 
@@ -142,7 +196,7 @@ class GenericComicDownloaderGUI:
             width=10
         )
         self.thread_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.thread_frame, text="(拷贝漫画)").pack(side=tk.LEFT)
+        ttk.Label(self.thread_frame, text="(推荐5个)").pack(side=tk.LEFT)
         
         self.download_thread_frame = ttk.Frame(self.main_frame)
         self.download_thread_frame.pack(fill=tk.X, pady=5)
@@ -200,17 +254,26 @@ class GenericComicDownloaderGUI:
         
         def on_site_change(*args):
             site_name = self.site_var.get()
-            if site_name == "快看":
-                self.cookie_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
-                self.thread_frame.pack_forget()
-            elif site_name == "腾讯动漫":
-                self.cookie_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
-                self.thread_frame.pack_forget()
-            elif site_name == "拷贝漫画":
-                self.cookie_frame.pack_forget()
-                self.thread_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
+            
+            if site_name == "腾讯动漫":
+                self.comic_id_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
             else:
-                self.cookie_frame.pack_forget()
+                self.comic_id_frame.pack_forget()
+                self.use_comic_id_var.set(False)
+                self.comic_id_var.set("")
+            
+            if site_name in SITES_REQUIRING_LOGIN:
+                self.login_frame.pack(fill=tk.X, pady=5, after=self.comic_id_frame if site_name == "腾讯动漫" else self.num_frame)
+                self.cookies_path_frame.pack(fill=tk.X, pady=5, after=self.login_frame)
+                self.thread_frame.pack(fill=tk.X, pady=5, after=self.cookies_path_frame)
+                self.update_login_status()
+            elif site_name == "拷贝漫画":
+                self.login_frame.pack_forget()
+                self.cookies_path_frame.pack_forget()
+                self.thread_frame.pack(fill=tk.X, pady=5, after=self.comic_id_frame if site_name == "腾讯动漫" else self.num_frame)
+            else:
+                self.login_frame.pack_forget()
+                self.cookies_path_frame.pack_forget()
                 self.thread_frame.pack_forget()
         
         self.site_var.trace("w", on_site_change)
@@ -406,25 +469,127 @@ class GenericComicDownloaderGUI:
             font=("微软雅黑", 10, "bold")
         )
     
-    def load_cookie_from_file(self):
-        path = filedialog.askopenfilename(
-            title="选择Cookie文件",
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
-        )
-        if path:
+    def load_config(self):
+        """加载配置文件"""
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"加载配置文件失败: {e}")
+        return {}
+    
+    def save_config(self):
+        """保存配置文件"""
+        try:
+            config = {
+                'cookies_dir': self.cookies_path_var.get().strip()
+            }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            self.cookies_dir = config['cookies_dir']
+        except Exception as e:
+            print(f"保存配置文件失败: {e}")
+    
+    def update_login_status(self):
+        """更新登录状态显示"""
+        site_name = self.site_var.get()
+        if site_name in SITES_REQUIRING_LOGIN:
+            temp_crawler = ComicCrawler.__new__(ComicCrawler)
+            temp_crawler.site_name = site_name
+            temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+            if temp_crawler.has_saved_cookies():
+                self.login_status_label.config(text="[已保存登录信息]", foreground="green")
+            else:
+                self.login_status_label.config(text="[未登录]", foreground="gray")
+    
+    def on_comic_id_check_change(self):
+        """漫画ID选项改变时的回调"""
+        if self.use_comic_id_var.get():
+            self.comic_id_entry.config(state=tk.NORMAL)
+        else:
+            self.comic_id_entry.config(state=tk.DISABLED)
+            self.comic_id_var.set("")
+    
+    def on_login_check_change(self):
+        """登录选项改变时的回调"""
+        if self.login_var.get():
+            self.login_button.config(state=tk.NORMAL)
+            self.update_login_status()
+        else:
+            self.login_button.config(state=tk.DISABLED)
+            self.login_complete_button.config(state=tk.DISABLED)
+            self.login_status_label.config(text="")
+    
+    def open_login_page(self):
+        """打开登录页面"""
+        if self.login_window_open:
+            messagebox.showinfo("提示", "登录页面已打开，请完成登录后点击'登录完成'按钮")
+            return
+        
+        site_name = self.site_var.get()
+        browser_path = self.browser_path_var.get().strip()
+        cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+        
+        self.save_config()
+        
+        def login_task():
             try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    cookie_content = f.read().strip()
-                self.cookie_text.delete("1.0", tk.END)
-                self.cookie_text.insert("1.0", cookie_content)
-                self.append_status(f"已从文件加载Cookie ({len(cookie_content)} 字符)")
+                self.login_button.config(state=tk.DISABLED)
+                self.append_status(f"正在打开 {site_name} 登录页面...")
+                
+                self.crawler = ComicCrawler(site_name, browser_path, headless=False, login_mode=True, cookies_dir=cookies_dir)
+                self.crawler.open_login_page()
+                
+                self.login_window_open = True
+                self.login_complete_button.config(state=tk.NORMAL)
+                self.append_status("请在浏览器中完成登录，然后点击'登录完成'按钮")
+                
             except Exception as e:
-                self.append_status(f"加载Cookie文件失败: {e}")
+                self.append_status(f"打开登录页面失败: {e}")
+                import traceback
+                self.append_status(traceback.format_exc())
+                self.login_button.config(state=tk.NORMAL)
+        
+        login_thread = threading.Thread(target=login_task)
+        login_thread.daemon = True
+        login_thread.start()
+    
+    def complete_login(self):
+        """完成登录，保存cookies"""
+        if not self.crawler:
+            messagebox.showerror("错误", "请先打开登录页面")
+            return
+        
+        try:
+            self.crawler.complete_login()
+            self.append_status("登录信息已保存！")
+            self.login_status_label.config(text="[已保存登录信息]", foreground="green")
+            self.login_complete_button.config(state=tk.DISABLED)
+            self.login_window_open = False
+            
+            if self.crawler.page:
+                self.crawler.page.close()
+                self.append_status("浏览器已关闭")
+            self.crawler = None
+            
+        except Exception as e:
+            self.append_status(f"保存登录信息失败: {e}")
+            import traceback
+            self.append_status(traceback.format_exc())
     
     def browse_path(self):
         path = filedialog.askdirectory(title="选择下载路径")
         if path:
             self.download_path_var.set(path)
+    
+    def browse_cookies_path(self):
+        """选择cookies保存路径"""
+        path = filedialog.askdirectory(title="选择Cookies保存路径")
+        if path:
+            self.cookies_path_var.set(path)
+            self.save_config()
+            self.update_login_status()
     
     def browse_browser(self):
         path = filedialog.askopenfilename(
@@ -511,9 +676,15 @@ class GenericComicDownloaderGUI:
                 messagebox.showerror("错误", "请选择有效的站点")
                 return
             
+            use_comic_id = site_name == "腾讯动漫" and self.use_comic_id_var.get()
+            comic_id = self.comic_id_var.get().strip() if use_comic_id else None
+            
             comic_name = self.comic_name_var.get().strip()
-            if not comic_name:
-                messagebox.showerror("错误", "请输入漫画名称")
+            if not comic_name and not comic_id:
+                if use_comic_id:
+                    messagebox.showerror("错误", "请输入漫画ID")
+                else:
+                    messagebox.showerror("错误", "请输入漫画名称")
                 return
             
             try:
@@ -535,24 +706,40 @@ class GenericComicDownloaderGUI:
             browser_path = self.browser_path_var.get().strip()
             headless = self.browser_mode_var.get() == "headless"
             
-
+            login_mode = self.login_var.get() and site_name in SITES_REQUIRING_LOGIN
+            cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
             
             self.confirm_button.config(state=tk.DISABLED)
             self.append_status(f"使用站点: {site_name}")
-            self.append_status(f"开始下载漫画: {comic_name}")
+            if comic_id:
+                self.append_status(f"使用漫画ID: {comic_id}")
+            else:
+                self.append_status(f"开始下载漫画: {comic_name}")
             if chapter_end > 0:
                 self.append_status(f"下载章节范围: 第{chapter_start}章 到 第{chapter_end}章")
             else:
                 self.append_status(f"下载章节范围: 第{chapter_start}章 到 最后一章")
             self.append_status(f"浏览器模式: {'无头' if headless else '有头'}")
+            if login_mode:
+                self.append_status(f"登录模式: 已启用")
+                self.append_status(f"Cookies路径: {cookies_dir}")
 
             self.append_status("正在启动浏览器...")
-            cookie = self.cookie_text.get("1.0", tk.END).strip() if site_name in ["快看", "腾讯动漫"] else None
-            crawler = ComicCrawler(site_name, browser_path, headless, cookie)
+            crawler = ComicCrawler(site_name, browser_path, headless, login_mode=login_mode, cookies_dir=cookies_dir)
             
             try:
-                self.append_status(f"正在搜索漫画: {comic_name}")
-                target_comic_tab = crawler.search_comic(comic_name)
+                if comic_id:
+                    self.append_status(f"正在通过ID访问漫画...")
+                    result = crawler.search_comic(comic_name, comic_id)
+                    if isinstance(result, tuple):
+                        target_comic_tab, actual_comic_name = result
+                        comic_name = actual_comic_name
+                        self.append_status(f"获取到漫画名字: {comic_name}")
+                    else:
+                        target_comic_tab = result
+                else:
+                    self.append_status(f"正在搜索漫画: {comic_name}")
+                    target_comic_tab = crawler.search_comic(comic_name)
                 self.append_status("成功打开漫画详情页")
                 
                 self.append_status("正在获取封面图片...")
@@ -572,6 +759,7 @@ class GenericComicDownloaderGUI:
                 
                 self.append_status("正在收集章节图片链接...")
                 max_workers = int(self.thread_var.get().strip())
+                self.append_status(f"同时打开标签页数: {max_workers}")
                 
                 self.append_status(f"DEBUG: 传给collect_chapters_images: chapter_start={actual_start}, chapter_end={actual_end}")
                 all_chapters_data = crawler.collect_chapters_images(
