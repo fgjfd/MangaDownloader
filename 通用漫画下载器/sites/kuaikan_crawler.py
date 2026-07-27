@@ -5,13 +5,40 @@ from utils import is_normal_url
 
 
 class KuaikanCrawler:
+    """快看漫画爬虫"""
+    
+    # 站点元数据
+    SITE_NAME = '快看'
+    SITE_URL = 'https://www.kuaikanmanhua.com/'
+    REQUIRES_LOGIN = True
+    
+    # 站点配置
+    CONFIG = {
+        'site_url': 'https://www.kuaikanmanhua.com/',
+        'locators': {
+            'search_input': 'xpath:/html/body/div[1]/div/div/div/div[1]/div[2]/div/div[1]/input',
+            'search_button': 'xpath:/html/body/div[1]/div/div/div/div[1]/div[2]/div/div[1]/a',
+            'search_result': 'xpath:/html/body/div[1]/div/div/div/div[3]/div[1]/div[1]/div[1]/a',
+            'cover_image': 'xpath:/html/body/div[1]/div/div/div/div[2]/div/div[1]/div/div[1]/img[3]',
+            'chapter_list': 'xpath:/html/body/div[1]/div/div/div/div[2]/div/div[2]/div[1]/div[1]/div/div[3]/div',
+            'chapter_group_button': 'xpath:/html/body/div[1]/div/div/div/div[2]/div/div[2]/div[1]/div[1]/div/div[2]/div',
+            'chapter_image_parent': 'xpath:/html/body/div[1]/div/div/div/div[4]/div[1]/div[1]/div',
+            'chapter_image': 'xpath:/html/body/div[1]/div/div/div/div[4]/div[1]/div[1]/div[num]/img'
+        },
+        'image_attr': 'data-src',
+        'chapter_group_size': 50
+    }
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators
         self.image_attr = crawler.image_attr
     
     def search_comic(self, comic_name, comic_id=None):
-        self.crawler.tab.get(self.crawler.site_config['site_url'])
+        search_url = f"https://www.kuaikanmanhua.com/sou/{comic_name}"
+        print(f"正在搜索漫画: {comic_name}")
+        print(f"搜索URL: {search_url}")
+        
+        self.crawler.tab.get(search_url)
         
         if self.crawler.login_mode:
             if self.crawler.has_saved_cookies():
@@ -19,10 +46,7 @@ class KuaikanCrawler:
                 self.crawler.tab.refresh()
                 time.sleep(1)
         
-        self.crawler.tab.ele(self.locators['search_input']).input(comic_name)
-        self.crawler.tab.ele(self.locators['search_button']).click()
-        
-        time.sleep(0.5)
+        time.sleep(2)
         
         target_comic_list = self.crawler.tab.ele(self.locators['search_result'])
         target_comic_tab = target_comic_list.click.for_new_tab()

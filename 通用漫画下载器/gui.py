@@ -9,7 +9,8 @@ import json
 from crawler import ComicCrawler
 from downloader import download_cover_image, download_all_chapters
 from utils import zip_main_folder
-from config import SITES, DEFAULT_SITE, BROWSER_PATHS, SITES_REQUIRING_LOGIN, DEFAULT_COOKIES_DIR, CONFIG_FILE
+from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_COOKIES_DIR, CONFIG_FILE
+from site_discovery import get_all_site_names, get_sites_requiring_login, get_site_download_mode
 
 
 class GenericComicDownloaderGUI:
@@ -58,12 +59,20 @@ class GenericComicDownloaderGUI:
         self.site_frame = ttk.Frame(self.main_frame)
         self.site_frame.pack(fill=tk.X, pady=5)
         
+        # 动态获取可用网站列表
+        self.available_sites = get_all_site_names()
+        self.sites_requiring_login = get_sites_requiring_login()
+        
         ttk.Label(self.site_frame, text="选择站点:", width=10).pack(side=tk.LEFT, padx=5)
-        self.site_var = tk.StringVar(value=DEFAULT_SITE)
+        
+        # 设置默认站点（如果存在）
+        default_site = DEFAULT_SITE if DEFAULT_SITE in self.available_sites else (self.available_sites[0] if self.available_sites else "")
+        
+        self.site_var = tk.StringVar(value=default_site)
         self.site_combo = ttk.Combobox(
             self.site_frame, 
             textvariable=self.site_var, 
-            values=list(SITES.keys()),
+            values=self.available_sites,
             state="readonly",
             width=20
         )
@@ -254,15 +263,20 @@ class GenericComicDownloaderGUI:
         
         def on_site_change(*args):
             site_name = self.site_var.get()
-            
+
             if site_name == "腾讯动漫":
                 self.comic_id_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
             else:
                 self.comic_id_frame.pack_forget()
                 self.use_comic_id_var.set(False)
                 self.comic_id_var.set("")
-            
-            if site_name in SITES_REQUIRING_LOGIN:
+
+            # 根据网站配置设置默认下载模式
+            download_mode = get_site_download_mode(site_name)
+            self.download_mode_var.set(download_mode)
+
+            # 使用动态获取的需要登录网站列表
+            if site_name in self.sites_requiring_login:
                 self.login_frame.pack(fill=tk.X, pady=5, after=self.comic_id_frame if site_name == "腾讯动漫" else self.num_frame)
                 self.cookies_path_frame.pack(fill=tk.X, pady=5, after=self.login_frame)
                 self.thread_frame.pack(fill=tk.X, pady=5, after=self.cookies_path_frame)
@@ -494,7 +508,8 @@ class GenericComicDownloaderGUI:
     def update_login_status(self):
         """更新登录状态显示"""
         site_name = self.site_var.get()
-        if site_name in SITES_REQUIRING_LOGIN:
+        # 使用动态获取的需要登录网站列表
+        if site_name in self.sites_requiring_login:
             temp_crawler = ComicCrawler.__new__(ComicCrawler)
             temp_crawler.site_name = site_name
             temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
@@ -672,7 +687,8 @@ class GenericComicDownloaderGUI:
     def download_task(self):
         try:
             site_name = self.site_var.get()
-            if site_name not in SITES:
+            # 使用动态获取的网站列表验证
+            if site_name not in self.available_sites:
                 messagebox.showerror("错误", "请选择有效的站点")
                 return
             
@@ -706,7 +722,8 @@ class GenericComicDownloaderGUI:
             browser_path = self.browser_path_var.get().strip()
             headless = self.browser_mode_var.get() == "headless"
             
-            login_mode = self.login_var.get() and site_name in SITES_REQUIRING_LOGIN
+            # 使用动态获取的需要登录网站列表
+            login_mode = self.login_var.get() and site_name in self.sites_requiring_login
             cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
             
             self.confirm_button.config(state=tk.DISABLED)

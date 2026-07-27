@@ -4,11 +4,12 @@ import re
 import subprocess
 from functools import partial
 
-subprocess.Popen = partial(subprocess.Popen, encoding='utf-8')
+# 隐藏子进程的控制台窗口
+CREATE_NO_WINDOW = 0x08000000
+subprocess.Popen = partial(subprocess.Popen, encoding='utf-8', creationflags=CREATE_NO_WINDOW)
 
 import execjs
 from lxml import etree
-
 
 
 js_code = """
@@ -72,6 +73,29 @@ ctx = execjs.compile(js_code)
 
 
 class TencentCrawler:
+    """腾讯动漫爬虫"""
+    
+    # 站点元数据
+    SITE_NAME = '腾讯动漫'
+    SITE_URL = 'https://ac.qq.com/'
+    REQUIRES_LOGIN = True
+    
+    # 站点配置
+    CONFIG = {
+        'site_url': 'https://ac.qq.com/',
+        'locators': {
+            'search_input': '@tag()=input',
+            'search_button': '@tag()=button',
+            'search_result': 'xpath:/html/body/div[3]/ul/li[1]/a',
+            'cover_image': 'xpath:/html/body/div[3]/div[3]/div/div/div[1]/a/img',
+            'chapter_list_container': 'xpath:/html/body/div[3]/em/div[2]/div[2]/div/div[2]/ol[1]/li',
+            'chapter_image_parent': 'xpath:/html/body/div[5]/ul/li',
+            'chapter_image': 'xpath:/html/body/div[5]/ul/li[num]/img'
+        },
+        'image_attr': 'src',
+        'chapter_group_size': None
+    }
+    
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators
@@ -102,12 +126,13 @@ class TencentCrawler:
             
             return target_comic_tab
         
+        search_url = f"https://ac.qq.com/Comic/searchList?search={comic_name}"
         print(f"\n========== 腾讯动漫搜索开始 ==========")
         print(f"搜索关键词: {comic_name}")
-        print(f"网站地址: {self.crawler.site_config['site_url']}")
+        print(f"搜索URL: {search_url}")
         
-        self.crawler.tab.get(self.crawler.site_config['site_url'])
-        print(f"已打开网站首页")
+        self.crawler.tab.get(search_url)
+        print(f"已打开搜索页面")
         
         if self.crawler.login_mode:
             if self.crawler.has_saved_cookies():
@@ -116,14 +141,8 @@ class TencentCrawler:
                 self.crawler.tab.refresh()
                 time.sleep(1)
         
-        print(f"输入搜索关键词...")
-        self.crawler.tab.ele(f"{self.locators['search_input']}").input(comic_name)
-        
-        print(f"点击搜索按钮...")
-        self.crawler.tab.ele(self.locators['search_button']).click()
-        
         print(f"等待搜索结果加载...")
-        time.sleep(1)
+        time.sleep(2)
         
         try:
             print(f"查找搜索结果 (定位器: {self.locators['search_result']})")

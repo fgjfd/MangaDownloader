@@ -5,6 +5,27 @@ from utils import is_normal_url
 
 
 class MangacopyCrawler:
+    """拷贝漫画爬虫"""
+    
+    # 站点元数据
+    SITE_NAME = '拷贝漫画'
+    SITE_URL = 'https://www.mangacopy.com/comics'
+    REQUIRES_LOGIN = False
+    
+    # 站点配置
+    CONFIG = {
+        'site_url': 'https://www.mangacopy.com/comics',
+        'locators': {
+            'search_result': 'xpath:/html/body/main/div[2]/div/div/div[1]/div[1]/div[1]/a',
+            'cover_image': 'xpath:/html/body/main/div[1]/div/div[1]/div/img',
+            'chapter_list': 'xpath:/html/body/main/div[2]/div[3]/div/div[2]/div/div[1]/ul[1]/a',
+            'chapter_link': 'xpath:/html/body/main/div[2]/div[3]/div/div[2]/div/div[1]/ul[1]/a[num]',
+            'chapter_image_parent': 'xpath:/html/body/div[2]/div/ul/li',
+            'chapter_image': 'xpath:/html/body/div[2]/div/ul/li[num]/img'
+        },
+        'image_attr': 'data-src',
+        'chapter_group_size': None
+    }
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators

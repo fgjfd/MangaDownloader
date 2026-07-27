@@ -3,11 +3,13 @@ from .haoduoman_crawler import HaoduomanCrawler
 from .mangacopy_crawler import MangacopyCrawler
 from .tencent_crawler import TencentCrawler
 from .boluobao_crawler import BoluobaoCrawler
+from .baozi_crawler import BaoziCrawler
 
 __all__ = [
     'KuaikanCrawler',
     'HaoduomanCrawler',
     'MangacopyCrawler',
     'TencentCrawler',
-    'BoluobaoCrawler'
+    'BoluobaoCrawler',
+    'BaoziCrawler'
 ]

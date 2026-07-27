@@ -6,9 +6,60 @@ import time
 import json
 import requests
 from concurrent.futures import ThreadPoolExecutor
+import winreg
 
 
-async def download_with_aiohttp(url, file_path, timeout=10):
+def get_system_proxy():
+    """获取 Windows 系统代理设置"""
+    try:
+        # 打开注册表
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0,
+            winreg.KEY_READ
+        )
+
+        # 检查是否启用代理
+        proxy_enable = winreg.QueryValueEx(key, "ProxyEnable")[0]
+
+        if proxy_enable:
+            # 获取代理服务器地址
+            proxy_server = winreg.QueryValueEx(key, "ProxyServer")[0]
+            winreg.CloseKey(key)
+
+            # 格式化代理地址（支持 http 和 https）
+            if '=' not in proxy_server:
+                # 格式: 127.0.0.1:7890
+                return {
+                    'http': f'http://{proxy_server}',
+                    'https': f'http://{proxy_server}'
+                }
+            else:
+                # 格式: http=127.0.0.1:7890;https=127.0.0.1:7890
+                proxies = {}
+                for item in proxy_server.split(';'):
+                    if '=' in item:
+                        proto, addr = item.split('=')
+                        proxies[proto] = f'http://{addr}'
+                return proxies
+
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"获取系统代理失败: {e}")
+
+    return None
+
+
+# 全局代理设置（启动时获取一次）
+_SYSTEM_PROXY = get_system_proxy()
+if _SYSTEM_PROXY:
+    print(f"检测到系统代理: {_SYSTEM_PROXY}")
+else:
+    print("未检测到系统代理，将直连下载")
+
+
+async def download_with_aiohttp(url, file_path, timeout=10, proxy=None):
     """使用aiohttp下载"""
     try:
         connector = aiohttp.TCPConnector(
@@ -17,12 +68,15 @@ async def download_with_aiohttp(url, file_path, timeout=10):
             force_close=True,
             ssl=False
         )
-        
+
+        # 使用传入的代理或全局代理
+        proxy_url = proxy or (_SYSTEM_PROXY.get('https') if _SYSTEM_PROXY else None)
+
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=timeout)
         ) as session:
-            async with session.get(url, allow_redirects=True) as response:
+            async with session.get(url, allow_redirects=True, proxy=proxy_url) as response:
                 if response.status == 200:
                     content = await response.read()
                     # 只要有内容就算成功（即使是空白图片）
@@ -40,10 +94,13 @@ async def download_with_aiohttp(url, file_path, timeout=10):
         return False, str(e)[:50]
 
 
-def download_with_requests(url, file_path, timeout=10):
+def download_with_requests(url, file_path, timeout=10, proxy=None):
     """使用requests下载（同步）"""
     try:
-        response = requests.get(url, stream=True, timeout=timeout)
+        # 使用传入的代理或全局代理
+        proxies = proxy or _SYSTEM_PROXY
+
+        response = requests.get(url, stream=True, timeout=timeout, proxies=proxies)
         response.raise_for_status()
         
         with open(file_path, 'wb') as f:
@@ -575,15 +632,32 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
     print(f"\n{'='*50}")
     print("核查章节图片数...")
     print(f"{'='*50}")
-    
-    # 统计每个章节的图片数
+
+    # 从image_urls.json读取每个章节的总图片数
     chapter_stats = {}
-    for img in failed_images:
-        chapter_num = img['chapter_num']
-        if chapter_num not in chapter_stats:
-            chapter_stats[chapter_num] = {'expected': 0, 'actual': 0, 'folder': img['folder']}
-        chapter_stats[chapter_num]['expected'] += 1
-    
+    image_urls_json = os.path.join(base_path, "image_urls.json")
+    if os.path.exists(image_urls_json):
+        try:
+            with open(image_urls_json, 'r', encoding='utf-8') as f:
+                url_data = json.load(f)
+            for chapter in url_data.get('chapters', []):
+                chapter_num = chapter['chapter_num']
+                chapter_stats[chapter_num] = {
+                    'expected': chapter['total_images'],
+                    'actual': 0,
+                    'folder': os.path.join(base_path, str(chapter_num))
+                }
+        except Exception as e:
+            print(f"读取image_urls.json失败: {e}")
+
+    # 如果没有image_urls.json，从failed_images推断
+    if not chapter_stats:
+        for img in failed_images:
+            chapter_num = img['chapter_num']
+            if chapter_num not in chapter_stats:
+                chapter_stats[chapter_num] = {'expected': 0, 'actual': 0, 'folder': img['folder']}
+            chapter_stats[chapter_num]['expected'] += 1
+
     # 检查实际文件数
     for chapter_num, stats in chapter_stats.items():
         folder = stats['folder']
@@ -591,14 +665,14 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
             # 统计文件夹中的.jpg文件
             actual_count = len([f for f in os.listdir(folder) if f.endswith('.jpg')])
             stats['actual'] = actual_count
-            
+
             if actual_count != stats['expected']:
                 print(f"⚠️ 章节 {chapter_num}: 期望 {stats['expected']} 张，实际 {actual_count} 张")
             else:
                 print(f"✓ 章节 {chapter_num}: {actual_count} 张 (正确)")
         else:
             print(f"✗ 章节 {chapter_num}: 文件夹不存在 {folder}")
-    
+
     print(f"{'='*50}")
     
     if all_failed:

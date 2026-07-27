@@ -4,22 +4,45 @@ import json
 
 
 class BoluobaoCrawler:
+    """菠萝包爬虫"""
+    
+    # 站点元数据
+    SITE_NAME = '菠萝包'
+    SITE_URL = 'https://www.sfacg.com/'
+    REQUIRES_LOGIN = True
+    
+    # 站点配置
+    CONFIG = {
+        'site_url': 'https://www.sfacg.com/',
+        'locators': {
+            'search_input': '@tag()=input',
+            'search_button': 'xpath:/html/body/div[1]/div[2]/div/div[1]/div[1]/span',
+            'search_result': 'xpath:/html/body/form/table[5]/tbody/tr/td/ul/li[2]/strong/a',
+            'cover_image': 'xpath:/html/body/div[2]/div[3]/ul[2]/li[1]/img',
+            'chapter_list': 'xpath:/html/body/div[3]/div[1]/div[3]/div[1]/a',
+            'chapter_link': 'xpath:/html/body/div[3]/div[1]/div[3]/div[1]/a[num]'
+        },
+        'image_attr': 'src',
+        'chapter_group_size': None,
+        'api_mode': True
+    }
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators
         self.image_attr = crawler.image_attr
     
     def search_comic(self, comic_name, comic_id=None):
-        self.crawler.tab.get(self.crawler.site_config['site_url'])
+        search_url = f"https://s.sfacg.com/?Key={comic_name}"
+        print(f"正在搜索漫画: {comic_name}")
+        print(f"搜索URL: {search_url}")
+        
+        self.crawler.tab.get(search_url)
         
         if self.crawler.login_mode:
             if self.crawler.has_saved_cookies():
                 self.crawler.load_cookies()
                 self.crawler.tab.refresh()
                 time.sleep(1)
-        
-        self.crawler.tab.ele(self.locators['search_input']).input(comic_name)
-        self.crawler.tab.ele(self.locators['search_button']).click()
         
         time.sleep(2)
         

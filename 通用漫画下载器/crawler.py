@@ -2,12 +2,8 @@ import time
 import os
 import json
 
-from config import SITES, SITES_REQUIRING_LOGIN, DEFAULT_COOKIES_DIR
-from sites.kuaikan_crawler import KuaikanCrawler
-from sites.haoduoman_crawler import HaoduomanCrawler
-from sites.mangacopy_crawler import MangacopyCrawler
-from sites.tencent_crawler import TencentCrawler
-from sites.boluobao_crawler import BoluobaoCrawler
+from config import DEFAULT_COOKIES_DIR
+from site_discovery import get_site_crawler_class
 
 
 class ComicCrawler:
@@ -16,7 +12,11 @@ class ComicCrawler:
         from urllib.parse import urlparse, unquote
         
         self.site_name = site_name
-        self.site_config = SITES[site_name]
+        
+        # 动态加载网站爬虫类
+        self.site_crawler_class = get_site_crawler_class(site_name)
+        self.site_config = self.site_crawler_class.CONFIG
+        
         self.locators = self.site_config['locators']
         self.image_attr = self.site_config['image_attr']
         self.cookie_str = cookie_str
@@ -56,21 +56,8 @@ class ComicCrawler:
             self.page = ChromiumPage(co)
             self.tab = self.page
         
-        self._init_site_crawler()
-    
-    def _init_site_crawler(self):
-        if self.site_name == '快看':
-            self.site_crawler = KuaikanCrawler(self)
-        elif self.site_name == '好多漫':
-            self.site_crawler = HaoduomanCrawler(self)
-        elif self.site_name == '拷贝漫画':
-            self.site_crawler = MangacopyCrawler(self)
-        elif self.site_name == '腾讯动漫':
-            self.site_crawler = TencentCrawler(self)
-        elif self.site_name == '菠萝包':
-            self.site_crawler = BoluobaoCrawler(self)
-        else:
-            raise ValueError(f"不支持的站点: {self.site_name}")
+        # 初始化网站爬虫实例
+        self.site_crawler = self.site_crawler_class(self)
     
     def get_cookies_path(self):
         if not os.path.exists(self.cookies_dir):

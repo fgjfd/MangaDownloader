@@ -6,6 +6,29 @@ from utils import is_normal_url
 
 
 class HaoduomanCrawler:
+    """好多漫爬虫"""
+    
+    # 站点元数据
+    SITE_NAME = '好多漫'
+    SITE_URL = 'https://www.haoduoman.com/'
+    REQUIRES_LOGIN = False
+    
+    # 站点配置
+    CONFIG = {
+        'site_url': 'https://www.haoduoman.com/',
+        'locators': {
+            'search_input': 'xpath:/html/body/header/div[2]/div/div[2]/div/form/div/p[1]/input',
+            'search_button': 'xpath:/html/body/header/div[2]/div/div[2]/div/form/div/p[2]/button',
+            'search_result': 'xpath:/html/body/main/div/div[2]/div/div[1]/div/div/div[2]/a',
+            'cover_image': 'xpath:/html/body/main/div/div[2]/div[1]/div/div/div/div[1]/img',
+            'chapter_list': 'xpath:/html/body/main/div/div[3]/div[2]/ul/li',
+            'chapter_link': 'xpath:/html/body/main/div/div[3]/div[2]/ul/li[num]/a',
+            'chapter_image_parent': 'xpath:/html/body/main/div[1]/div/div[1]/div',
+            'chapter_image_data_original': 'xpath:/html/body/main/div[1]/div/div[1]/div[num]'
+        },
+        'image_attr': 'data-original',
+        'chapter_group_size': None
+    }
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators
