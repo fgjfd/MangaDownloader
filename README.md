@@ -158,7 +158,7 @@ class NewsiteCrawler:
 
 ### 开发规范
 
-1. **必须使用XPath**：元素定位必须使用完整XPath，禁止CSS选择器
+1. **定位元素推荐使用XPath**：也可以选择其它dp支持的定位语法
 2. **文件命名**：`{站点简称}_crawler.py`，如 `gmh_crawler.py`
 3. **类命名**：`{站点简称}Crawler`，如 `GmhCrawler`
 4. **必需方法**：
@@ -166,9 +166,6 @@ class NewsiteCrawler:
    - `search_comic(self, comic_name, comic_id=None)`
    - `get_chapter_count(self, target_comic_tab)`
    - `collect_chapters_images(...)`
-5. **可选重写**：
-   - `get_cover_image()` - 封面图片属性不同时
-   - `get_chapter_image_urls()` - 图片提取逻辑
 
 详细开发指南请参考：[新站点爬虫开发Skill.md](新站点爬虫开发Skill.md)
 
@@ -237,69 +234,15 @@ CONFIG = {
 - 删除站点会永久移除 `.py` 文件，重启后生效
 - 可通过"打开目录"按钮直接管理 `sites_data/` 文件夹
 
-### 下载提示
-
-- 大章节漫画建议分批下载
-- 失败图片会生成JSON列表，可单独重试
-- 下载完成后自动压缩为ZIP文件
-- Cookie信息保存在 `cookies/` 目录
-
-## 常见问题
-
-**Q: 浏览器启动失败？**
-
-A: 检查浏览器路径是否正确，或尝试关闭现有浏览器进程后重试。
-
-**Q: 搜索不到漫画？**
-
-A: 确认站点是否支持该漫画，或尝试使用漫画ID（腾讯动漫等）。
-
-**Q: 图片下载失败？**
-
-A: 部分站点CDN需要代理，可在爬虫CONFIG中配置proxy参数。
-
-**Q: 如何添加新站点？**
-
-A: 参考 `新站点爬虫开发Skill.md` 文档开发爬虫文件，放入 `sites_data/` 目录即可。
-
-## 技术栈
-
-- **Python 3.8+** - 编程语言
-- **DrissionPage** - 浏览器自动化库
-- **aiohttp** - 异步HTTP客户端
-- **Tkinter** - GUI框架
-- **requests** - HTTP库
-
 ## 开源协议
 
 本项目采用 MIT 协议开源。
-
-## 贡献指南
-
-欢迎提交Issue和Pull Request！
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 提交 Pull Request
-
-## 更新日志
-
-### v1.0.0 (2026-07-29)
-- 初始版本发布
-- 支持多站点插件化架构
-- GUI界面和命令行模式
-- 站点管理功能（添加/删除/刷新）
-- 失败图片重试机制
-- 支持小包子漫画、G社漫画等站点
 
 ## 致谢
 
 感谢以下开源项目：
 
 - [DrissionPage](https://github.com/g1879/DrissionPage) - 优秀的浏览器自动化库
-- [aiohttp](https://github.com/aio-libs/aiohttp) - 强大的异步HTTP框架
 
 ---
 
