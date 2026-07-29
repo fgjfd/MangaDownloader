@@ -23,4 +23,3 @@ DEFAULT_SITE = '拷贝漫画'
 DEFAULT_COOKIES_DIR = 'cookies'
 
 CONFIG_FILE = 'config.json'
-

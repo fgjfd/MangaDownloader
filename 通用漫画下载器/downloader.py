@@ -428,6 +428,7 @@ def save_image_urls_to_json(all_chapters_data, comic_name, base_path=None):
         
         url_mapping["chapters"].append(chapter_info)
     
+    
     json_path = os.path.join(main_folder, "image_urls.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(url_mapping, f, ensure_ascii=False, indent=2)
