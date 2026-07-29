@@ -10,470 +10,290 @@ from crawler import ComicCrawler
 from downloader import download_cover_image, download_all_chapters
 from utils import zip_main_folder
 from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_COOKIES_DIR, CONFIG_FILE
-from site_discovery import get_all_site_names, get_sites_requiring_login, get_site_download_mode
+from site_discovery import get_all_site_names, get_sites_requiring_login, get_site_download_mode, refresh_sites as _refresh_sites_cache, add_site_file as _add_site_file, add_site_folder as _add_site_folder, remove_site as _remove_site, _get_data_dir
 
 
 class GenericComicDownloaderGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("通用漫画下载器")
-        self.root.geometry("900x700")
+        self.root.geometry("960x720")
         self.root.resizable(True, True)
         
         self.crawler = None
         self.login_window_open = False
         self.cookies_dir = self.load_config().get('cookies_dir', DEFAULT_COOKIES_DIR)
         
-        self.canvas = tk.Canvas(root, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        # 直接使用Frame，不使用Canvas滚动
+        self.main_frame = ttk.Frame(root, padding="10")
+        self.main_frame.pack(fill="both", expand=True)
         
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-        
-        self.main_frame = ttk.Frame(self.canvas, padding="10")
-        
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.main_frame, anchor="nw", width=860)
-        
-        def on_frame_configure(event=None):
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        
-        def on_canvas_configure(event=None):
-            canvas_width = event.width
-            self.canvas.itemconfig(self.canvas_window, width=canvas_width)
-        
-        self.main_frame.bind("<Configure>", on_frame_configure)
-        self.canvas.bind("<Configure>", on_canvas_configure)
-        
-        def on_mousewheel(event):
-            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        self.canvas.bind_all("<MouseWheel>", on_mousewheel)
-        
+        # ========== 标题 ==========
         title_label = ttk.Label(
             self.main_frame, 
             text="通用漫画下载器", 
-            font=("微软雅黑", 18, "bold")
+            font=("微软雅黑", 16, "bold")
         )
-        title_label.pack(pady=10)
+        title_label.pack(pady=(0, 8))
+
+        # ========== 站点选择 + 管理按钮 ==========
+        site_row = ttk.Frame(self.main_frame)
+        site_row.pack(fill=tk.X, pady=3)
+
+        ttk.Label(site_row, text="站点:").pack(side=tk.LEFT, padx=(0, 4))
         
-        self.site_frame = ttk.Frame(self.main_frame)
-        self.site_frame.pack(fill=tk.X, pady=5)
-        
-        # 动态获取可用网站列表
         self.available_sites = get_all_site_names()
         self.sites_requiring_login = get_sites_requiring_login()
-        
-        ttk.Label(self.site_frame, text="选择站点:", width=10).pack(side=tk.LEFT, padx=5)
-        
-        # 设置默认站点（如果存在）
         default_site = DEFAULT_SITE if DEFAULT_SITE in self.available_sites else (self.available_sites[0] if self.available_sites else "")
-        
         self.site_var = tk.StringVar(value=default_site)
         self.site_combo = ttk.Combobox(
-            self.site_frame, 
+            site_row, 
             textvariable=self.site_var, 
             values=self.available_sites,
             state="readonly",
-            width=20
+            width=14
         )
-        self.site_combo.pack(side=tk.LEFT, padx=5)
-        
-        self.name_frame = ttk.Frame(self.main_frame)
-        self.name_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(self.name_frame, text="漫画名称:", width=10).pack(side=tk.LEFT, padx=5)
+        self.site_combo.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(site_row, text="添加文件", command=self.add_site_file, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="添加文件夹", command=self.add_site_folder, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="删除站点", command=self.remove_current_site, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="刷新", command=self.refresh_site_list, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="打开目录", command=self.open_sites_dir, width=8).pack(side=tk.LEFT, padx=2)
+
+        self.site_count_label = ttk.Label(
+            site_row,
+            text=f"已加载 {len(self.available_sites)} 个站点",
+            font=("微软雅黑", 9)
+        )
+        self.site_count_label.pack(side=tk.RIGHT, padx=4)
+
+        # ========== 两栏布局 ==========
+        columns_frame = ttk.Frame(self.main_frame)
+        columns_frame.pack(fill=tk.X, pady=5)
+
+        # 左栏 - 漫画设置
+        left_col = ttk.LabelFrame(columns_frame, text="漫画设置", padding="8")
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        # 漫画名称
+        name_row = ttk.Frame(left_col)
+        name_row.pack(fill=tk.X, pady=2)
+        ttk.Label(name_row, text="漫画名称:", width=9).pack(side=tk.LEFT)
         self.comic_name_var = tk.StringVar()
-        self.comic_name_entry = ttk.Entry(
-            self.name_frame, 
-            textvariable=self.comic_name_var, 
-            font=("微软雅黑", 10)
-        )
-        self.comic_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        self.num_frame = ttk.Frame(self.main_frame)
-        self.num_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(self.num_frame, text="章节范围:", width=10).pack(side=tk.LEFT, padx=5)
-        
+        self.comic_name_entry = ttk.Entry(name_row, textvariable=self.comic_name_var, font=("微软雅黑", 10))
+        self.comic_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # 章节范围
+        chapter_row = ttk.Frame(left_col)
+        chapter_row.pack(fill=tk.X, pady=2)
+        ttk.Label(chapter_row, text="章节范围:", width=9).pack(side=tk.LEFT)
         self.chapter_start_var = tk.StringVar(value="1")
-        self.chapter_start_entry = ttk.Entry(
-            self.num_frame, 
-            textvariable=self.chapter_start_var, 
-            font=("微软雅黑", 10),
-            width=8
-        )
-        self.chapter_start_entry.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(self.num_frame, text="到").pack(side=tk.LEFT, padx=2)
-        
+        ttk.Entry(chapter_row, textvariable=self.chapter_start_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(chapter_row, text="到").pack(side=tk.LEFT)
         self.chapter_end_var = tk.StringVar(value="0")
-        self.chapter_end_entry = ttk.Entry(
-            self.num_frame, 
-            textvariable=self.chapter_end_var, 
-            font=("微软雅黑", 10),
-            width=8
-        )
-        self.chapter_end_entry.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(self.num_frame, text="(结束填0表示到最后一章)").pack(side=tk.LEFT, padx=5)
-        
-        self.comic_id_frame = ttk.Frame(self.main_frame)
-        
+        ttk.Entry(chapter_row, textvariable=self.chapter_end_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(chapter_row, text="(0=末章)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
+
+        # 漫画ID (腾讯动漫)
+        self.comic_id_frame = ttk.Frame(left_col)
         self.use_comic_id_var = tk.BooleanVar(value=False)
-        self.use_comic_id_check = ttk.Checkbutton(
+        ttk.Checkbutton(
             self.comic_id_frame,
             text="使用漫画ID",
             variable=self.use_comic_id_var,
             command=self.on_comic_id_check_change
-        )
-        self.use_comic_id_check.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(self.comic_id_frame, text="漫画ID:", width=8).pack(side=tk.LEFT, padx=5)
+        ).pack(side=tk.LEFT)
+        ttk.Label(self.comic_id_frame, text="ID:").pack(side=tk.LEFT, padx=2)
         self.comic_id_var = tk.StringVar()
         self.comic_id_entry = ttk.Entry(
             self.comic_id_frame,
             textvariable=self.comic_id_var,
-            font=("微软雅黑", 10),
-            width=15,
+            width=12,
             state=tk.DISABLED
         )
-        self.comic_id_entry.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(self.comic_id_frame, text="(腾讯动漫可直接输入ID，如: 544298)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=5)
-        
-        self.login_frame = ttk.Frame(self.main_frame)
-        
+        self.comic_id_entry.pack(side=tk.LEFT, padx=2)
+
+        # 登录设置
+        self.login_frame = ttk.Frame(left_col)
         self.login_var = tk.BooleanVar(value=False)
         self.login_check = ttk.Checkbutton(
             self.login_frame,
-            text="需要登录账号",
+            text="需要登录",
             variable=self.login_var,
             command=self.on_login_check_change
         )
-        self.login_check.pack(side=tk.LEFT, padx=5)
-        
-        self.login_status_label = ttk.Label(
-            self.login_frame,
-            text="",
-            font=("微软雅黑", 9)
-        )
-        self.login_status_label.pack(side=tk.LEFT, padx=5)
-        
-        self.login_button = ttk.Button(
-            self.login_frame,
-            text="打开登录页面",
-            command=self.open_login_page,
-            width=12
-        )
-        self.login_button.pack(side=tk.LEFT, padx=5)
-        
-        self.login_complete_button = ttk.Button(
-            self.login_frame,
-            text="登录完成",
-            command=self.complete_login,
-            width=10,
-            state=tk.DISABLED
-        )
-        self.login_complete_button.pack(side=tk.LEFT, padx=5)
-        
-        self.cookies_path_frame = ttk.Frame(self.main_frame)
-        
-        ttk.Label(self.cookies_path_frame, text="Cookies路径:", width=10).pack(side=tk.LEFT, padx=5)
+        self.login_check.pack(side=tk.LEFT)
+        self.login_status_label = ttk.Label(self.login_frame, text="", font=("微软雅黑", 9))
+        self.login_status_label.pack(side=tk.LEFT, padx=4)
+        self.login_button = ttk.Button(self.login_frame, text="打开登录", command=self.open_login_page, width=10, state=tk.DISABLED)
+        self.login_button.pack(side=tk.LEFT, padx=2)
+        self.login_complete_button = ttk.Button(self.login_frame, text="登录完成", command=self.complete_login, width=8, state=tk.DISABLED)
+        self.login_complete_button.pack(side=tk.LEFT, padx=2)
+
+        # Cookies路径
+        self.cookies_path_frame = ttk.Frame(left_col)
+        ttk.Label(self.cookies_path_frame, text="Cookies:", width=9).pack(side=tk.LEFT)
         self.cookies_path_var = tk.StringVar(value=self.cookies_dir)
-        self.cookies_path_entry = ttk.Entry(
-            self.cookies_path_frame,
-            textvariable=self.cookies_path_var,
-            font=("微软雅黑", 10)
-        )
-        self.cookies_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        ttk.Button(
-            self.cookies_path_frame,
-            text="浏览",
-            command=self.browse_cookies_path,
-            width=8
-        ).pack(side=tk.LEFT, padx=5)
-        
-        self.thread_frame = ttk.Frame(self.main_frame)
-        
-        ttk.Label(self.thread_frame, text="同时打开标签页数:", width=14).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(self.cookies_path_frame, textvariable=self.cookies_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(self.cookies_path_frame, text="浏览", command=self.browse_cookies_path, width=6).pack(side=tk.LEFT, padx=2)
+
+        # 下载路径
+        path_row = ttk.Frame(left_col)
+        path_row.pack(fill=tk.X, pady=2)
+        ttk.Label(path_row, text="下载路径:", width=9).pack(side=tk.LEFT)
+        self.download_path_var = tk.StringVar()
+        ttk.Entry(path_row, textvariable=self.download_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(path_row, text="浏览", command=self.browse_path, width=6).pack(side=tk.LEFT, padx=2)
+
+        # 右栏 - 下载 & 浏览器设置
+        right_col = ttk.LabelFrame(columns_frame, text="下载设置", padding="8")
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        # 标签页数
+        thread_row = ttk.Frame(right_col)
+        thread_row.pack(fill=tk.X, pady=2)
+        ttk.Label(thread_row, text="标签页数:", width=9).pack(side=tk.LEFT)
         self.thread_var = tk.StringVar(value="5")
-        self.thread_entry = ttk.Entry(
-            self.thread_frame, 
-            textvariable=self.thread_var, 
-            font=("微软雅黑", 10),
-            width=10
-        )
-        self.thread_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.thread_frame, text="(推荐5个)").pack(side=tk.LEFT)
-        
-        self.download_thread_frame = ttk.Frame(self.main_frame)
-        self.download_thread_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(self.download_thread_frame, text="下载线程数:", width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(thread_row, textvariable=self.thread_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(thread_row, text="(推荐5)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
+
+        # 下载线程 + 模式
+        dl_row = ttk.Frame(right_col)
+        dl_row.pack(fill=tk.X, pady=2)
+        ttk.Label(dl_row, text="下载线程:", width=9).pack(side=tk.LEFT)
         self.download_thread_var = tk.StringVar(value="4")
-        self.download_thread_entry = ttk.Entry(
-            self.download_thread_frame, 
-            textvariable=self.download_thread_var, 
-            font=("微软雅黑", 10),
-            width=10
-        )
-        self.download_thread_entry.pack(side=tk.LEFT, padx=5)
-        
-        # 下载模式选择
+        ttk.Entry(dl_row, textvariable=self.download_thread_var, width=6).pack(side=tk.LEFT, padx=2)
         self.download_mode_var = tk.StringVar(value="coroutine")
-        ttk.Radiobutton(
-            self.download_thread_frame, 
-            text="协程模式", 
-            variable=self.download_mode_var, 
-            value="coroutine"
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(
-            self.download_thread_frame, 
-            text="纯多线程", 
-            variable=self.download_mode_var, 
-            value="thread_only"
-        ).pack(side=tk.LEFT, padx=5)
-        
-        # 超时时间设置
-        self.timeout_frame = ttk.Frame(self.main_frame)
-        self.timeout_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(self.timeout_frame, text="首次超时:", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(dl_row, text="协程", variable=self.download_mode_var, value="coroutine").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(dl_row, text="多线程", variable=self.download_mode_var, value="thread_only").pack(side=tk.LEFT, padx=4)
+
+        # 超时设置
+        timeout_row = ttk.Frame(right_col)
+        timeout_row.pack(fill=tk.X, pady=2)
+        ttk.Label(timeout_row, text="首次超时:", width=9).pack(side=tk.LEFT)
         self.first_timeout_var = tk.StringVar(value="8")
-        self.first_timeout_entry = ttk.Entry(
-            self.timeout_frame, 
-            textvariable=self.first_timeout_var, 
-            font=("微软雅黑", 10),
-            width=8
-        )
-        self.first_timeout_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.timeout_frame, text="秒").pack(side=tk.LEFT, padx=(0, 15))
-        
-        ttk.Label(self.timeout_frame, text="重试超时:", width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(timeout_row, textvariable=self.first_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(timeout_row, text="秒").pack(side=tk.LEFT)
+        ttk.Label(timeout_row, text="重试:", width=5).pack(side=tk.LEFT, padx=(8, 0))
         self.retry_timeout_var = tk.StringVar(value="15")
-        self.retry_timeout_entry = ttk.Entry(
-            self.timeout_frame, 
-            textvariable=self.retry_timeout_var, 
-            font=("微软雅黑", 10),
-            width=8
-        )
-        self.retry_timeout_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.timeout_frame, text="秒 (推荐: 首次8秒, 重试15秒)").pack(side=tk.LEFT)
-        
+        ttk.Entry(timeout_row, textvariable=self.retry_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(timeout_row, text="秒").pack(side=tk.LEFT)
+
+        # 浏览器类型
+        browser_type_row = ttk.Frame(right_col)
+        browser_type_row.pack(fill=tk.X, pady=2)
+        ttk.Label(browser_type_row, text="浏览器:", width=9).pack(side=tk.LEFT)
+        self.browser_type_var = tk.StringVar(value="edge")
+        ttk.Radiobutton(browser_type_row, text="Edge", variable=self.browser_type_var, value="edge", command=self.update_browser_path).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(browser_type_row, text="Chrome", variable=self.browser_type_var, value="chrome", command=self.update_browser_path).pack(side=tk.LEFT, padx=4)
+        self.browser_mode_var = tk.StringVar(value="headed")
+        ttk.Radiobutton(browser_type_row, text="有头", variable=self.browser_mode_var, value="headed").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(browser_type_row, text="无头", variable=self.browser_mode_var, value="headless").pack(side=tk.LEFT, padx=4)
+
+        # 浏览器路径
+        browser_path_row = ttk.Frame(right_col)
+        browser_path_row.pack(fill=tk.X, pady=2)
+        ttk.Label(browser_path_row, text="路径:", width=9).pack(side=tk.LEFT)
+        self.browser_path_var = tk.StringVar(value=BROWSER_PATHS['edge'])
+        ttk.Entry(browser_path_row, textvariable=self.browser_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(browser_path_row, text="浏览", command=self.browse_browser, width=6).pack(side=tk.LEFT, padx=2)
+
+        # ========== 站点切换逻辑 ==========
         def on_site_change(*args):
             site_name = self.site_var.get()
 
+            # 站点为空时（首次启动无站点），隐藏条件区域
+            if not site_name:
+                self.comic_id_frame.pack_forget()
+                self.login_frame.pack_forget()
+                self.cookies_path_frame.pack_forget()
+                return
+
+            # 漫画ID
             if site_name == "腾讯动漫":
-                self.comic_id_frame.pack(fill=tk.X, pady=5, after=self.num_frame)
+                self.comic_id_frame.pack(fill=tk.X, pady=2, after=self.comic_name_entry.master)
             else:
                 self.comic_id_frame.pack_forget()
                 self.use_comic_id_var.set(False)
                 self.comic_id_var.set("")
 
-            # 根据网站配置设置默认下载模式
-            download_mode = get_site_download_mode(site_name)
-            self.download_mode_var.set(download_mode)
+            # 下载模式
+            try:
+                download_mode = get_site_download_mode(site_name)
+                self.download_mode_var.set(download_mode)
+            except ValueError:
+                pass
 
-            # 使用动态获取的需要登录网站列表
+            # 登录
             if site_name in self.sites_requiring_login:
-                self.login_frame.pack(fill=tk.X, pady=5, after=self.comic_id_frame if site_name == "腾讯动漫" else self.num_frame)
-                self.cookies_path_frame.pack(fill=tk.X, pady=5, after=self.login_frame)
-                self.thread_frame.pack(fill=tk.X, pady=5, after=self.cookies_path_frame)
+                self.login_frame.pack(fill=tk.X, pady=2, after=self.comic_id_frame if site_name == "腾讯动漫" else chapter_row)
+                self.cookies_path_frame.pack(fill=tk.X, pady=2, after=self.login_frame)
                 self.update_login_status()
             elif site_name == "拷贝漫画":
                 self.login_frame.pack_forget()
                 self.cookies_path_frame.pack_forget()
-                self.thread_frame.pack(fill=tk.X, pady=5, after=self.comic_id_frame if site_name == "腾讯动漫" else self.num_frame)
             else:
                 self.login_frame.pack_forget()
                 self.cookies_path_frame.pack_forget()
-                self.thread_frame.pack_forget()
-        
+
         self.site_var.trace("w", on_site_change)
         on_site_change()
-        
-        self.path_frame = ttk.Frame(self.main_frame)
-        self.path_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(self.path_frame, text="下载路径:", width=10).pack(side=tk.LEFT, padx=5)
-        self.download_path_var = tk.StringVar()
-        self.download_path_entry = ttk.Entry(
-            self.path_frame, 
-            textvariable=self.download_path_var, 
-            font=("微软雅黑", 10)
-        )
-        self.download_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        ttk.Button(
-            self.path_frame, 
-            text="浏览", 
-            command=self.browse_path,
-            width=8
-        ).pack(side=tk.LEFT, padx=5)
-        
-        self.browser_frame = ttk.LabelFrame(self.main_frame, text="浏览器设置", padding="10")
-        self.browser_frame.pack(fill=tk.X, pady=10)
-        
-        self.browser_type_frame = ttk.Frame(self.browser_frame)
-        self.browser_type_frame.pack(fill=tk.X, pady=3)
-        
-        ttk.Label(self.browser_type_frame, text="浏览器类型:", width=10).pack(side=tk.LEFT, padx=5)
-        self.browser_type_var = tk.StringVar(value="edge")
-        
-        ttk.Radiobutton(
-            self.browser_type_frame, 
-            text="Edge", 
-            variable=self.browser_type_var, 
-            value="edge",
-            command=self.update_browser_path
-        ).pack(side=tk.LEFT, padx=10)
-        
-        ttk.Radiobutton(
-            self.browser_type_frame, 
-            text="Chrome", 
-            variable=self.browser_type_var, 
-            value="chrome",
-            command=self.update_browser_path
-        ).pack(side=tk.LEFT, padx=10)
-        
-        self.browser_path_frame = ttk.Frame(self.browser_frame)
-        self.browser_path_frame.pack(fill=tk.X, pady=3)
-        
-        ttk.Label(self.browser_path_frame, text="浏览器路径:", width=10).pack(side=tk.LEFT, padx=5)
-        self.browser_path_var = tk.StringVar(value=BROWSER_PATHS['edge'])
-        self.browser_path_entry = ttk.Entry(
-            self.browser_path_frame, 
-            textvariable=self.browser_path_var, 
-            font=("微软雅黑", 10)
-        )
-        self.browser_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        ttk.Button(
-            self.browser_path_frame, 
-            text="浏览", 
-            command=self.browse_browser,
-            width=8
-        ).pack(side=tk.LEFT, padx=5)
-        
-        self.browser_mode_frame = ttk.Frame(self.browser_frame)
-        self.browser_mode_frame.pack(fill=tk.X, pady=3)
-        
-        ttk.Label(self.browser_mode_frame, text="浏览器模式:", width=10).pack(side=tk.LEFT, padx=5)
-        self.browser_mode_var = tk.StringVar(value="headed")
-        
-        ttk.Radiobutton(
-            self.browser_mode_frame, 
-            text="有头模式", 
-            variable=self.browser_mode_var, 
-            value="headed"
-        ).pack(side=tk.LEFT, padx=10)
-        
-        ttk.Radiobutton(
-            self.browser_mode_frame, 
-            text="无头模式", 
-            variable=self.browser_mode_var, 
-            value="headless"
-        ).pack(side=tk.LEFT, padx=10)
-        
 
-        
+        # ========== 按钮行 ==========
         self.button_frame = ttk.Frame(self.main_frame)
-        self.button_frame.pack(fill=tk.X, pady=10)
-        
+        self.button_frame.pack(fill=tk.X, pady=8)
+
+        ttk.Button(self.button_frame, text="清空状态", command=self.clear_status).pack(side=tk.LEFT, padx=3)
+        ttk.Button(self.button_frame, text="下载失败图片", command=self.download_failed_images).pack(side=tk.LEFT, padx=3)
+        ttk.Button(self.button_frame, text="退出", command=root.quit).pack(side=tk.RIGHT, padx=3)
         self.confirm_button = ttk.Button(
             self.button_frame,
             text="开始下载",
             command=self.start_download,
             style="Accent.TButton"
         )
-        self.confirm_button.pack(side=tk.RIGHT, padx=5)
-        
-        ttk.Button(
-            self.button_frame,
-            text="清空状态",
-            command=self.clear_status
-        ).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(
-            self.button_frame,
-            text="下载失败图片",
-            command=self.download_failed_images
-        ).pack(side=tk.LEFT, padx=5)
-        
+        self.confirm_button.pack(side=tk.RIGHT, padx=3)
 
-        
-        ttk.Button(
-            self.button_frame,
-            text="退出",
-            command=root.quit
-        ).pack(side=tk.RIGHT, padx=5)
-        
-        self.url_progress_frame = ttk.LabelFrame(self.main_frame, text="获取图片URL进度", padding="10")
-        self.url_progress_frame.pack(fill=tk.X, pady=5)
-        
-        self.url_info_frame = ttk.Frame(self.url_progress_frame)
-        self.url_info_frame.pack(fill=tk.X, pady=5)
-        
-        self.url_progress_label = ttk.Label(
-            self.url_info_frame,
-            text="进度: 0/0 个章节",
-            font=("微软雅黑", 10)
-        )
-        self.url_progress_label.pack(side=tk.LEFT, padx=5)
-        
-        self.url_progress_bar = ttk.Progressbar(
-            self.url_progress_frame,
-            orient=tk.HORIZONTAL,
-            mode='determinate',
-            length=600
-        )
-        self.url_progress_bar.pack(fill=tk.X, pady=5)
-        
-        self.progress_frame = ttk.LabelFrame(self.main_frame, text="下载进度", padding="10")
-        self.progress_frame.pack(fill=tk.X, pady=5)
-        
-        self.info_frame = ttk.Frame(self.progress_frame)
-        self.info_frame.pack(fill=tk.X, pady=5)
-        
-        self.progress_label = ttk.Label(
-            self.info_frame,
-            text="进度: 0/0 张图片",
-            font=("微软雅黑", 10)
-        )
-        self.progress_label.pack(side=tk.LEFT, padx=5)
-        
-        self.speed_label = ttk.Label(
-            self.info_frame,
-            text="网速: 0 KB/s",
-            font=("微软雅黑", 10)
-        )
-        self.speed_label.pack(side=tk.RIGHT, padx=5)
-        
-        self.progress_bar = ttk.Progressbar(
-            self.progress_frame,
-            orient=tk.HORIZONTAL,
-            mode='determinate',
-            length=600
-        )
-        self.progress_bar.pack(fill=tk.X, pady=5)
-        
+        # ========== 进度区域 ==========
+        self.url_progress_frame = ttk.LabelFrame(self.main_frame, text="获取图片URL进度", padding="8")
+        self.url_progress_frame.pack(fill=tk.X, pady=3)
 
-        
-        self.status_frame = ttk.LabelFrame(self.main_frame, text="下载状态", padding="10")
-        self.status_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
+        url_info = ttk.Frame(self.url_progress_frame)
+        url_info.pack(fill=tk.X)
+        self.url_progress_label = ttk.Label(url_info, text="进度: 0/0 个章节", font=("微软雅黑", 10))
+        self.url_progress_label.pack(side=tk.LEFT, padx=4)
+        self.url_progress_bar = ttk.Progressbar(self.url_progress_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.url_progress_bar.pack(fill=tk.X, pady=3)
+
+        self.progress_frame = ttk.LabelFrame(self.main_frame, text="下载进度", padding="8")
+        self.progress_frame.pack(fill=tk.X, pady=3)
+
+        dl_info = ttk.Frame(self.progress_frame)
+        dl_info.pack(fill=tk.X)
+        self.progress_label = ttk.Label(dl_info, text="进度: 0/0 张图片", font=("微软雅黑", 10))
+        self.progress_label.pack(side=tk.LEFT, padx=4)
+        self.speed_label = ttk.Label(dl_info, text="网速: 0 KB/s", font=("微软雅黑", 10))
+        self.speed_label.pack(side=tk.RIGHT, padx=4)
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, pady=3)
+
+        # ========== 状态日志 ==========
+        self.status_frame = ttk.LabelFrame(self.main_frame, text="下载状态", padding="8")
+        self.status_frame.pack(fill=tk.X, pady=3)
+
         self.status_text = tk.Text(
-            self.status_frame, 
+            self.status_frame,
             font=("微软雅黑", 10),
             wrap=tk.WORD,
-            state=tk.DISABLED
+            state=tk.DISABLED,
+            height=12
         )
-        self.status_text.pack(fill=tk.BOTH, expand=True)
-        
-        self.scrollbar = ttk.Scrollbar(self.status_text, command=self.status_text.yview)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.status_text.config(yscrollcommand=self.scrollbar.set)
+        self.status_text.pack(fill=tk.X)
+
+        status_scrollbar = ttk.Scrollbar(self.status_text, command=self.status_text.yview)
+        status_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text.config(yscrollcommand=status_scrollbar.set)
 
         self.style = ttk.Style()
         self.style.configure(
@@ -703,6 +523,7 @@ class GenericComicDownloaderGUI:
                     messagebox.showerror("错误", "请输入漫画名称")
                 return
             
+            
             try:
                 chapter_start = int(self.chapter_start_var.get().strip() or "1")
                 chapter_end = int(self.chapter_end_var.get().strip() or "0")
@@ -710,13 +531,16 @@ class GenericComicDownloaderGUI:
                 messagebox.showerror("错误", "章节范围必须是数字")
                 return
             
+            
             if chapter_start < 1:
                 messagebox.showerror("错误", "起始章节必须大于等于1")
                 return
             
+            
             if chapter_end > 0 and chapter_end < chapter_start:
                 messagebox.showerror("错误", "结束章节必须大于等于起始章节")
                 return
+            
             
             browser_type = self.browser_type_var.get()
             browser_path = self.browser_path_var.get().strip()
@@ -773,17 +597,17 @@ class GenericComicDownloaderGUI:
                 self.append_status(f"总章节数: {total_chapters}, 将下载: {actual_start}-{actual_end} 共{actual_chapters}章")
                 self.append_status(f"DEBUG: chapter_start={chapter_start}, chapter_end={chapter_end}, actual_start={actual_start}, actual_end={actual_end}")
                 self.reset_url_progress(actual_chapters)
-                
+
                 self.append_status("正在收集章节图片链接...")
-                max_workers = int(self.thread_var.get().strip())
-                self.append_status(f"同时打开标签页数: {max_workers}")
-                
+                max_threads = int(self.thread_var.get().strip())
+                self.append_status(f"同时打开标签页数: {max_threads}")
+
                 self.append_status(f"DEBUG: 传给collect_chapters_images: chapter_start={actual_start}, chapter_end={actual_end}")
                 all_chapters_data = crawler.collect_chapters_images(
-                    target_comic_tab, 
+                    target_comic_tab,
                     chapter_start=actual_start,
                     chapter_end=actual_end,
-                    max_workers=max_workers, 
+                    max_threads=max_threads,
                     progress_callback=self.update_url_progress
                 )
 
@@ -926,6 +750,126 @@ class GenericComicDownloaderGUI:
         retry_thread = threading.Thread(target=retry_task)
         retry_thread.daemon = True
         retry_thread.start()
+
+    def refresh_site_list(self):
+        """刷新站点列表"""
+        _refresh_sites_cache()
+        self.available_sites = get_all_site_names()
+        self.sites_requiring_login = get_sites_requiring_login()
+
+        # 更新站点下拉框
+        self.site_combo['values'] = self.available_sites
+
+        # 如果当前选中的站点不在列表中，选择第一个
+        if self.site_var.get() not in self.available_sites:
+            if self.available_sites:
+                self.site_var.set(self.available_sites[0])
+            else:
+                self.site_var.set('')
+
+        # 更新站点计数
+        self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
+        self.append_status(f"站点列表已刷新，共 {len(self.available_sites)} 个站点")
+
+    def add_site_file(self):
+        """添加站点文件"""
+        file_paths = filedialog.askopenfilenames(
+            title="选择站点爬虫文件",
+            filetypes=[("Python文件", "*.py"), ("所有文件", "*.*")]
+        )
+        if not file_paths:
+            return
+
+        added = []
+        errors = []
+        skipped = []
+
+        for path in file_paths:
+            try:
+                name = _add_site_file(path)
+                added.append(name)
+            except ValueError as e:
+                err_msg = str(e)
+                if '已存在' in err_msg:
+                    skipped.append((os.path.basename(path), err_msg))
+                else:
+                    errors.append((os.path.basename(path), err_msg))
+
+        if added:
+            self.append_status(f"已添加站点: {', '.join(added)}")
+            self.available_sites = get_all_site_names()
+            self.sites_requiring_login = get_sites_requiring_login()
+            self.site_combo['values'] = self.available_sites
+            self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
+            self.site_var.set(added[0])
+        if skipped:
+            for file, reason in skipped:
+                self.append_status(f"跳过重复: {file} - {reason}")
+        if errors:
+            for file, err in errors:
+                self.append_status(f"添加 {file} 失败: {err}")
+            if not added:
+                messagebox.showerror("添加失败", "\n".join(f"{f}: {e}" for f, e in errors))
+
+    def add_site_folder(self):
+        """添加站点文件夹"""
+        folder = filedialog.askdirectory(title="选择包含站点爬虫文件的文件夹")
+        if not folder:
+            return
+
+        try:
+            added, errors, skipped = _add_site_folder(folder)
+            if added:
+                names = [n for _, n in added]
+                self.append_status(f"已添加 {len(added)} 个站点: {', '.join(names)}")
+                self.available_sites = get_all_site_names()
+                self.sites_requiring_login = get_sites_requiring_login()
+                self.site_combo['values'] = self.available_sites
+                self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
+                self.site_var.set(names[0])
+            if skipped:
+                for file, reason in skipped:
+                    self.append_status(f"跳过重复: {file} - {reason}")
+            if errors:
+                for file, err in errors:
+                    self.append_status(f"添加 {file} 失败: {err}")
+            if not added and not errors and not skipped:
+                self.append_status("该文件夹中没有找到站点文件(*_crawler.py)")
+                messagebox.showinfo("提示", "该文件夹中没有找到站点文件(*_crawler.py)")
+        except Exception as e:
+            self.append_status(f"添加站点文件夹失败: {e}")
+            messagebox.showerror("错误", str(e))
+
+    def remove_current_site(self):
+        """删除当前选中的站点"""
+        site_name = self.site_var.get()
+        if not site_name:
+            messagebox.showwarning("提示", "请先选择要删除的站点")
+            return
+
+        if not messagebox.askyesno("确认删除", f"确定要删除站点「{site_name}」吗？"):
+            return
+
+        try:
+            _remove_site(site_name)
+            self.append_status(f"已删除站点: {site_name}")
+            self.available_sites = get_all_site_names()
+            self.sites_requiring_login = get_sites_requiring_login()
+            self.site_combo['values'] = self.available_sites
+            self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
+            if self.available_sites:
+                self.site_var.set(self.available_sites[0])
+            else:
+                self.site_var.set('')
+        except Exception as e:
+            self.append_status(f"删除站点失败: {e}")
+            messagebox.showerror("错误", str(e))
+
+    def open_sites_dir(self):
+        """打开站点数据目录"""
+        data_dir = _get_data_dir()
+        os.startfile(data_dir)
+
 
 
 
