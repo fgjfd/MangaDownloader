@@ -170,6 +170,10 @@ class ComicCrawler:
         return self.site_crawler.search_comic(comic_name, comic_id)
     
     def get_cover_image(self, target_comic_tab):
+        # 优先使用站点爬虫自定义的get_cover_image
+        if hasattr(self.site_crawler, 'get_cover_image') and callable(self.site_crawler.get_cover_image):
+            return self.site_crawler.get_cover_image(target_comic_tab)
+        # 默认实现：用locators和image_attr
         try:
             coverimg_xpath = self.locators['cover_image']
             coverimg_url = target_comic_tab.ele(coverimg_xpath).attr(self.image_attr)
@@ -182,11 +186,11 @@ class ComicCrawler:
     def get_chapter_count(self, target_comic_tab):
         return self.site_crawler.get_chapter_count(target_comic_tab)
     
-    def collect_chapters_images(self, target_comic_tab, chapter_start=1, chapter_end=0, max_workers=10, progress_callback=None):
+    def collect_chapters_images(self, target_comic_tab, chapter_start=1, chapter_end=0, max_threads=10, progress_callback=None):
         return self.site_crawler.collect_chapters_images(
-            target_comic_tab, 
+            target_comic_tab,
             chapter_start=chapter_start,
             chapter_end=chapter_end,
-            max_threads=max_workers,
+            max_threads=max_threads,
             progress_callback=progress_callback
         )

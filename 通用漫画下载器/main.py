@@ -4,7 +4,8 @@ import asyncio
 from crawler import ComicCrawler
 from downloader import download_cover_image, download_all_chapters
 from utils import zip_main_folder
-from config import SITES, DEFAULT_SITE, BROWSER_PATHS
+from config import DEFAULT_SITE, BROWSER_PATHS
+from site_discovery import get_all_site_names
 
 
 def main():
@@ -13,15 +14,17 @@ def main():
     print("通用漫画下载器")
     print("=" * 50)
     
+    site_names = get_all_site_names()
     print("\n可用站点:")
-    for i, site_name in enumerate(SITES.keys(), 1):
-        print(f"  {i}. {site_name}")
+    for i, name in enumerate(site_names, 1):
+        print(f"  {i}. {name}")
     
     try:
-        site_choice = input(f"\n请选择站点 (1-{len(SITES)}, 默认:{list(SITES.keys()).index(DEFAULT_SITE)+1}): ").strip()
+        default_index = site_names.index(DEFAULT_SITE) + 1 if DEFAULT_SITE in site_names else 1
+        site_choice = input(f"\n请选择站点 (1-{len(site_names)}, 默认:{default_index}): ").strip()
         if site_choice:
             site_index = int(site_choice) - 1
-            site_name = list(SITES.keys())[site_index]
+            site_name = site_names[site_index]
         else:
             site_name = DEFAULT_SITE
     except (ValueError, IndexError):
