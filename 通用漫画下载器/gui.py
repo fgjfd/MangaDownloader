@@ -1,4 +1,7 @@
 # GUI界面 - 通用漫画下载器
+from utils import ensure_console_safe
+ensure_console_safe()  # 入口加固：防GBK打印崩溃/无控制台print异常，须在其他导入前执行
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
@@ -7,10 +10,10 @@ import os
 import time
 import json
 from crawler import ComicCrawler
-from downloader import download_cover_image, download_all_chapters
-from utils import zip_main_folder
+from download_flow import run_download_flow
+from downloader import is_browser_render_site
 from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_COOKIES_DIR, CONFIG_FILE
-from site_discovery import get_all_site_names, get_sites_requiring_login, get_site_download_mode, refresh_sites as _refresh_sites_cache, add_site_file as _add_site_file, add_site_folder as _add_site_folder, remove_site as _remove_site, _get_data_dir
+from site_discovery import get_all_site_names, get_sites_requiring_login, get_sites_supporting_cookie, get_site_download_mode, refresh_sites as _refresh_sites_cache, add_site_file as _add_site_file, add_site_folder as _add_site_folder, remove_site as _remove_site, _get_data_dir, get_all_sites_info
 
 
 class GenericComicDownloaderGUI:
@@ -44,6 +47,8 @@ class GenericComicDownloaderGUI:
         
         self.available_sites = get_all_site_names()
         self.sites_requiring_login = get_sites_requiring_login()
+        self.sites_supporting_cookie = get_sites_supporting_cookie()
+        self.site_url_map = self._build_site_url_map()
         default_site = DEFAULT_SITE if DEFAULT_SITE in self.available_sites else (self.available_sites[0] if self.available_sites else "")
         self.site_var = tk.StringVar(value=default_site)
         self.site_combo = ttk.Combobox(
@@ -67,6 +72,19 @@ class GenericComicDownloaderGUI:
             font=("微软雅黑", 9)
         )
         self.site_count_label.pack(side=tk.RIGHT, padx=4)
+
+        # ========== 当前站点网址显示 ==========
+        url_row = ttk.Frame(self.main_frame)
+        url_row.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(url_row, text="网站地址:", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=(0, 4))
+        self.site_url_label = ttk.Label(
+            url_row,
+            text="",
+            font=("微软雅黑", 9),
+            foreground="blue"
+        )
+        self.site_url_label.pack(side=tk.LEFT)
+        ttk.Button(url_row, text="复制", command=self.copy_site_url, width=5).pack(side=tk.LEFT, padx=(4, 0))
 
         # ========== 两栏布局 ==========
         columns_frame = ttk.Frame(self.main_frame)
@@ -138,8 +156,17 @@ class GenericComicDownloaderGUI:
         ttk.Entry(self.cookies_path_frame, textvariable=self.cookies_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         ttk.Button(self.cookies_path_frame, text="浏览", command=self.browse_cookies_path, width=6).pack(side=tk.LEFT, padx=2)
 
+        # Cookie字符串输入（仅对声明支持Cookie的站点显示，如B站漫画解锁已购章节）
+        self.cookie_str_frame = ttk.Frame(left_col)
+        ttk.Label(self.cookie_str_frame, text="Cookie:", width=9).pack(side=tk.LEFT)
+        self.cookie_str_var = tk.StringVar()
+        ttk.Entry(self.cookie_str_frame, textvariable=self.cookie_str_var, font=("微软雅黑", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(self.cookie_str_frame, text="保存", command=self.save_cookie_str, width=5).pack(side=tk.LEFT, padx=1)
+        ttk.Button(self.cookie_str_frame, text="清除", command=self.clear_cookie_str, width=5).pack(side=tk.LEFT, padx=1)
+
         # 下载路径
         path_row = ttk.Frame(left_col)
+        self.path_row = path_row
         path_row.pack(fill=tk.X, pady=2)
         ttk.Label(path_row, text="下载路径:", width=9).pack(side=tk.LEFT)
         self.download_path_var = tk.StringVar()
@@ -203,11 +230,19 @@ class GenericComicDownloaderGUI:
         def on_site_change(*args):
             site_name = self.site_var.get()
 
+            # 更新网站地址显示
+            site_url = self.site_url_map.get(site_name, '')
+            if site_url:
+                self.site_url_label.config(text=site_url, foreground="blue")
+            else:
+                self.site_url_label.config(text="（未提供网址）", foreground="gray")
+
             # 站点为空时（首次启动无站点），隐藏条件区域
             if not site_name:
                 self.comic_id_frame.pack_forget()
                 self.login_frame.pack_forget()
                 self.cookies_path_frame.pack_forget()
+                self.cookie_str_frame.pack_forget()
                 return
 
             # 漫画ID
@@ -236,6 +271,13 @@ class GenericComicDownloaderGUI:
             else:
                 self.login_frame.pack_forget()
                 self.cookies_path_frame.pack_forget()
+
+            # Cookie字符串输入：仅对声明支持Cookie的站点显示
+            if site_name in self.sites_supporting_cookie:
+                self.cookie_str_frame.pack(fill=tk.X, pady=2, before=self.path_row)
+                self._sync_cookie_str_display(site_name)
+            else:
+                self.cookie_str_frame.pack_forget()
 
         self.site_var.trace("w", on_site_change)
         on_site_change()
@@ -302,6 +344,9 @@ class GenericComicDownloaderGUI:
             background="black",
             font=("微软雅黑", 10, "bold")
         )
+
+        # 恢复上次保存的下载设置
+        self.apply_saved_config()
     
     def load_config(self):
         """加载配置文件"""
@@ -314,16 +359,48 @@ class GenericComicDownloaderGUI:
         return {}
     
     def save_config(self):
-        """保存配置文件"""
+        """保存配置文件（含全部下载设置，下次启动自动恢复）"""
         try:
             config = {
-                'cookies_dir': self.cookies_path_var.get().strip()
+                'cookies_dir': self.cookies_path_var.get().strip(),
+                'download_path': self.download_path_var.get().strip(),
+                'max_tabs': self.thread_var.get().strip(),
+                'download_threads': self.download_thread_var.get().strip(),
+                'download_mode': self.download_mode_var.get(),
+                'first_timeout': self.first_timeout_var.get().strip(),
+                'retry_timeout': self.retry_timeout_var.get().strip(),
+                'browser_type': self.browser_type_var.get(),
+                'browser_mode': self.browser_mode_var.get(),
+                'browser_path': self.browser_path_var.get().strip(),
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
             self.cookies_dir = config['cookies_dir']
         except Exception as e:
             print(f"保存配置文件失败: {e}")
+    
+    def apply_saved_config(self):
+        """启动时恢复上次保存的设置"""
+        config = self.load_config()
+        if not config:
+            return
+        mapping = {
+            'download_path': self.download_path_var,
+            'max_tabs': self.thread_var,
+            'download_threads': self.download_thread_var,
+            'first_timeout': self.first_timeout_var,
+            'retry_timeout': self.retry_timeout_var,
+            'browser_path': self.browser_path_var,
+        }
+        for key, var in mapping.items():
+            if config.get(key):
+                var.set(config[key])
+        if config.get('download_mode') in ('coroutine', 'thread_only'):
+            self.download_mode_var.set(config['download_mode'])
+        if config.get('browser_type') in ('edge', 'chrome'):
+            self.browser_type_var.set(config['browser_type'])
+        if config.get('browser_mode') in ('headed', 'headless'):
+            self.browser_mode_var.set(config['browser_mode'])
     
     def update_login_status(self):
         """更新登录状态显示"""
@@ -333,10 +410,52 @@ class GenericComicDownloaderGUI:
             temp_crawler = ComicCrawler.__new__(ComicCrawler)
             temp_crawler.site_name = site_name
             temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
-            if temp_crawler.has_saved_cookies():
+            if temp_crawler.has_saved_cookies() or temp_crawler.has_cookie_str():
                 self.login_status_label.config(text="[已保存登录信息]", foreground="green")
             else:
                 self.login_status_label.config(text="[未登录]", foreground="gray")
+    
+    def _make_temp_crawler(self):
+        """构造不启动浏览器的临时Crawler实例（仅用于Cookie文件操作）"""
+        site_name = self.site_var.get()
+        temp_crawler = ComicCrawler.__new__(ComicCrawler)
+        temp_crawler.site_name = site_name
+        temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+        return temp_crawler
+
+    def _sync_cookie_str_display(self, site_name=None):
+        """切换站点时回显已保存的Cookie字符串"""
+        try:
+            temp_crawler = self._make_temp_crawler()
+            saved = temp_crawler.load_cookie_str()
+            self.cookie_str_var.set(saved or '')
+        except Exception:
+            self.cookie_str_var.set('')
+
+    def save_cookie_str(self):
+        """保存用户粘贴的Cookie字符串"""
+        cookie_str = self.cookie_str_var.get().strip()
+        if not cookie_str:
+            messagebox.showinfo("提示", "请先粘贴Cookie字符串")
+            return
+        try:
+            temp_crawler = self._make_temp_crawler()
+            if temp_crawler.save_cookie_str(cookie_str):
+                self.append_status(f"Cookie已保存（下次下载自动以登录态访问 {self.site_var.get()}）")
+                self.update_login_status()
+        except Exception as e:
+            self.append_status(f"保存Cookie失败: {e}")
+
+    def clear_cookie_str(self):
+        """清除已保存的Cookie字符串"""
+        try:
+            temp_crawler = self._make_temp_crawler()
+            temp_crawler.clear_cookie_str()
+            self.cookie_str_var.set('')
+            self.append_status(f"已清除 {self.site_var.get()} 的Cookie")
+            self.update_login_status()
+        except Exception as e:
+            self.append_status(f"清除Cookie失败: {e}")
     
     def on_comic_id_check_change(self):
         """漫画ID选项改变时的回调"""
@@ -546,6 +665,7 @@ class GenericComicDownloaderGUI:
             login_mode = self.login_var.get() and site_name in self.sites_requiring_login
             cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
             
+            self.save_config()
             self.confirm_button.config(state=tk.DISABLED)
             self.append_status(f"使用站点: {site_name}")
             if comic_id:
@@ -560,109 +680,67 @@ class GenericComicDownloaderGUI:
             if login_mode:
                 self.append_status(f"登录模式: 已启用")
                 self.append_status(f"Cookies路径: {cookies_dir}")
-
+            
             self.append_status("正在启动浏览器...")
             crawler = ComicCrawler(site_name, browser_path, headless, login_mode=login_mode, cookies_dir=cookies_dir)
-            
+                        
             try:
-                if comic_id:
-                    self.append_status(f"正在通过ID访问漫画...")
-                    result = crawler.search_comic(comic_name, comic_id)
-                    if isinstance(result, tuple):
-                        target_comic_tab, actual_comic_name = result
-                        comic_name = actual_comic_name
-                        self.append_status(f"获取到漫画名字: {comic_name}")
-                    else:
-                        target_comic_tab = result
-                else:
-                    self.append_status(f"正在搜索漫画: {comic_name}")
-                    target_comic_tab = crawler.search_comic(comic_name)
-                self.append_status("成功打开漫画详情页")
-                
-                self.append_status("正在获取封面图片...")
-                cover_url = crawler.get_cover_image(target_comic_tab)
-                
-                self.append_status("正在获取章节数量...")
-                total_chapters = crawler.get_chapter_count(target_comic_tab)
-                
-                # 计算实际下载范围
-                actual_start = chapter_start
-                actual_end = min(chapter_end, total_chapters) if chapter_end > 0 else total_chapters
-                actual_chapters = actual_end - actual_start + 1
-                
-                self.append_status(f"总章节数: {total_chapters}, 将下载: {actual_start}-{actual_end} 共{actual_chapters}章")
-                self.append_status(f"DEBUG: chapter_start={chapter_start}, chapter_end={chapter_end}, actual_start={actual_start}, actual_end={actual_end}")
-                self.reset_url_progress(actual_chapters)
-
-                self.append_status("正在收集章节图片链接...")
                 max_threads = int(self.thread_var.get().strip())
-                self.append_status(f"同时打开标签页数: {max_threads}")
-
-                self.append_status(f"DEBUG: 传给collect_chapters_images: chapter_start={actual_start}, chapter_end={actual_end}")
-                all_chapters_data = crawler.collect_chapters_images(
-                    target_comic_tab,
-                    chapter_start=actual_start,
-                    chapter_end=actual_end,
-                    max_threads=max_threads,
-                    progress_callback=self.update_url_progress
-                )
-
-                self.append_status(f"将下载 {len(all_chapters_data)} 个章节")
-                
-                total_images = sum(len(c['herf_list']) for c in all_chapters_data)
-                self.reset_progress(total_images)
-                self.append_status(f"总计 {total_images} 张图片")
-                
+                download_thread_count = int(self.download_thread_var.get().strip())
+                use_thread_only = self.download_mode_var.get() == "thread_only"
+                first_timeout = int(self.first_timeout_var.get().strip())
+                retry_timeout = int(self.retry_timeout_var.get().strip())
                 download_path = self.download_path_var.get().strip()
-                
-                if cover_url:
-                    self.append_status("正在下载封面...")
-                    asyncio.run(download_cover_image(cover_url, comic_name, download_path if download_path else None))
-                
-                if all_chapters_data:
-                    self.append_status("开始下载章节图片...")
-                    download_thread_count = int(self.download_thread_var.get().strip())
-                    use_thread_only = self.download_mode_var.get() == "thread_only"
-                    first_timeout = int(self.first_timeout_var.get().strip())
-                    retry_timeout = int(self.retry_timeout_var.get().strip())
-                    if use_thread_only:
-                        self.append_status(f"使用纯多线程模式，线程数: {download_thread_count}")
+            
+                self.append_status(f"同时打开标签页数: {max_threads}")
+                self.append_status(f"下载模式: {'纯多线程' if use_thread_only else '协程'}，线程数: {download_thread_count}")
+                self.append_status(f"首次超时: {first_timeout}秒, 重试超时: {retry_timeout}秒")
+            
+                def pre_collect(actual_count):
+                    self.reset_url_progress(actual_count)
+            
+                def pre_download(total_images):
+                    self.reset_progress(total_images)
+                    if total_images == 0 and is_browser_render_site(crawler.site_crawler):
+                        self.append_status("浏览器渲染模式：图片总数在下载时确定")
                     else:
-                        self.append_status(f"使用协程模式")
-                    self.append_status(f"首次超时: {first_timeout}秒, 重试超时: {retry_timeout}秒")
-                    failed_downloads, failed_json_path, should_zip = asyncio.run(
-                        download_all_chapters(
-                            all_chapters_data,
-                            comic_name,
-                            download_path if download_path else None,
-                            download_thread_count=download_thread_count,
-                            progress_callback=self.update_progress,
-                            max_retries=3,
-                            use_thread_only=use_thread_only,
-                            first_timeout=first_timeout,
-                            retry_timeout=retry_timeout
-                        )
-                    )
-
-                    if failed_downloads:
-                        self.append_status(f"\n⚠️  注意：以下图片最终下载失败（共 {len(failed_downloads)} 张）:")
-                        for failed in failed_downloads:
-                            self.append_status(f"  - 章节{failed['chapter_num']}-第{failed['image_index']}张")
-                            self.append_status(f"    路径: {failed['path']}")
-                            self.append_status(f"    URL: {failed['url']}")
-                        self.append_status(f"\n失败列表已保存到: {failed_json_path}")
-
-                    if should_zip:
-                        self.append_status("正在压缩文件夹...")
-                        zip_main_folder(comic_name, download_path if download_path else None)
-
-                        self.append_status(f"✓ 漫画《{comic_name}》下载完成！")
-                        messagebox.showinfo("成功", f"漫画《{comic_name}》下载完成！")
-                    else:
-                        self.append_status("⚠️ 由于存在下载失败的图片，跳过压缩步骤")
-                        self.append_status(f"✓ 漫画《{comic_name}》下载完成（有失败图片）！")
-                        messagebox.showwarning("完成", f"漫画《{comic_name}》下载完成！\n\n注意：有 {len(failed_downloads)} 张图片最终下载失败。\n失败列表已保存到:\n{failed_json_path}\n\n请使用'下载失败图片'功能重新下载。")
-                
+                        self.append_status(f"总计 {total_images} 张图片")
+            
+                result = run_download_flow(
+                    crawler, comic_name, comic_id=comic_id,
+                    chapter_start=chapter_start, chapter_end=chapter_end,
+                    max_threads=max_threads,
+                    download_path=download_path if download_path else None,
+                    log=self.append_status,
+                    progress_callback=self.update_progress,
+                    download_thread_count=download_thread_count,
+                    use_thread_only=use_thread_only,
+                    first_timeout=first_timeout,
+                    retry_timeout=retry_timeout,
+                    url_progress_callback=self.update_url_progress,
+                    pre_download_hook=pre_download,
+                    pre_collect_hook=pre_collect,
+                )
+            
+                comic_name = result['comic_name']
+                failed_downloads = result['failed_downloads']
+            
+                if not result['chapters_data']:
+                    self.append_status("没有获取到任何章节数据")
+                elif failed_downloads:
+                    self.append_status(f"\n⚠️  注意：以下图片最终下载失败（共 {len(failed_downloads)} 张）:")
+                    for failed in failed_downloads:
+                        self.append_status(f"  - 章节{failed['chapter_num']}-第{failed['image_index']}张")
+                        self.append_status(f"    路径: {failed['path']}")
+                        self.append_status(f"    URL: {failed['url']}")
+                    self.append_status(f"\n失败列表已保存到: {result['failed_json_path']}")
+                    self.append_status("⚠️  由于存在下载失败的图片，跳过压缩步骤")
+                    self.append_status(f"✓ 漫画《{comic_name}》下载完成（有失败图片）！")
+                    messagebox.showwarning("完成", f"漫画《{comic_name}》下载完成！\n\n注意：有 {len(failed_downloads)} 张图片最终下载失败。\n失败列表已保存到:\n{result['failed_json_path']}\n\n请使用'下载失败图片'功能重新下载。")
+                else:
+                    self.append_status(f"✓ 漫画《{comic_name}》下载完成！")
+                    messagebox.showinfo("成功", f"漫画《{comic_name}》下载完成！")
+                            
             finally:
                 crawler.page.close()
                 self.append_status("浏览器已关闭")
@@ -704,24 +782,39 @@ class GenericComicDownloaderGUI:
                 self.reset_progress(total_images)
 
                 download_thread_count = int(self.download_thread_var.get().strip())
-                first_timeout = int(self.first_timeout_var.get().strip())
-                retry_timeout = int(self.retry_timeout_var.get().strip())
 
-                # 导入函数
-                from downloader import download_from_failed_json
-
-                still_failed, all_success = asyncio.run(
-                    download_from_failed_json(
-                        json_path,
-                        concurrent_limit=3,
-                        download_thread_count=download_thread_count,
-                        use_thread_coroutine=True,
+                if data.get('render_mode'):
+                    # 浏览器渲染模式（加密站点）：HTTP重试无效，重跑失败章节的浏览器提取
+                    retry_site = data.get('site_name') or self.site_var.get()
+                    browser_path = self.browser_path_var.get().strip()
+                    headless = self.browser_mode_var.get() == "headless"
+                    cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+                    self.append_status(f"浏览器渲染模式({data.get('render_mode')})：重跑失败章节的浏览器提取，站点: {retry_site}")
+                    from downloader import retry_failed_chapters_via_browser
+                    still_failed, all_success = retry_failed_chapters_via_browser(
+                        json_path, retry_site, browser_path, headless=headless,
+                        cookies_dir=cookies_dir,
                         progress_callback=self.update_progress,
-                        max_retries=3,
-                        first_timeout=first_timeout,
-                        retry_timeout=retry_timeout
+                        max_workers=max(1, download_thread_count))
+                else:
+                    first_timeout = int(self.first_timeout_var.get().strip())
+                    retry_timeout = int(self.retry_timeout_var.get().strip())
+
+                    # 导入函数
+                    from downloader import download_from_failed_json
+
+                    still_failed, all_success = asyncio.run(
+                        download_from_failed_json(
+                            json_path,
+                            concurrent_limit=3,
+                            download_thread_count=download_thread_count,
+                            use_thread_coroutine=True,
+                            progress_callback=self.update_progress,
+                            max_retries=3,
+                            first_timeout=first_timeout,
+                            retry_timeout=retry_timeout
+                        )
                     )
-                )
 
                 if all_success:
                     self.append_status(f"\n✓ 所有失败图片下载成功！")
@@ -752,6 +845,7 @@ class GenericComicDownloaderGUI:
         _refresh_sites_cache()
         self.available_sites = get_all_site_names()
         self.sites_requiring_login = get_sites_requiring_login()
+        self.sites_supporting_cookie = get_sites_supporting_cookie()
 
         # 更新站点下拉框
         self.site_combo['values'] = self.available_sites
@@ -795,6 +889,8 @@ class GenericComicDownloaderGUI:
             self.append_status(f"已添加站点: {', '.join(added)}")
             self.available_sites = get_all_site_names()
             self.sites_requiring_login = get_sites_requiring_login()
+            self.sites_supporting_cookie = get_sites_supporting_cookie()
+            self._refresh_site_url_map()
             self.site_combo['values'] = self.available_sites
             self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
             self.site_var.set(added[0])
@@ -820,6 +916,8 @@ class GenericComicDownloaderGUI:
                 self.append_status(f"已添加 {len(added)} 个站点: {', '.join(names)}")
                 self.available_sites = get_all_site_names()
                 self.sites_requiring_login = get_sites_requiring_login()
+                self.sites_supporting_cookie = get_sites_supporting_cookie()
+                self._refresh_site_url_map()
                 self.site_combo['values'] = self.available_sites
                 self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
                 self.site_var.set(names[0])
@@ -851,6 +949,8 @@ class GenericComicDownloaderGUI:
             self.append_status(f"已删除站点: {site_name}")
             self.available_sites = get_all_site_names()
             self.sites_requiring_login = get_sites_requiring_login()
+            self.sites_supporting_cookie = get_sites_supporting_cookie()
+            self._refresh_site_url_map()
             self.site_combo['values'] = self.available_sites
             self.site_count_label.config(text=f"已加载 {len(self.available_sites)} 个站点")
             if self.available_sites:
@@ -865,6 +965,32 @@ class GenericComicDownloaderGUI:
         """打开站点数据目录"""
         data_dir = _get_data_dir()
         os.startfile(data_dir)
+
+    def copy_site_url(self):
+        """复制当前站点网址到剪贴板"""
+        url = self.site_url_label.cget("text")
+        if url and url != "（未提供网址）":
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self.append_status(f"已复制网址: {url}")
+
+    def _build_site_url_map(self):
+        """构建站点名称到网址的映射"""
+        url_map = {}
+        for info in get_all_sites_info():
+            if info.get('site_url'):
+                url_map[info['name']] = info['site_url']
+        return url_map
+
+    def _refresh_site_url_map(self):
+        """刷新站点网址映射并更新显示"""
+        self.site_url_map = self._build_site_url_map()
+        site_name = self.site_var.get()
+        site_url = self.site_url_map.get(site_name, '')
+        if site_url:
+            self.site_url_label.config(text=site_url, foreground="blue")
+        else:
+            self.site_url_label.config(text="（未提供网址）", foreground="gray")
 
 
 

@@ -1,5 +1,33 @@
 import os
+import sys
 import zipfile
+
+def ensure_console_safe():
+    """入口加固：
+    1. GBK控制台下打印✓/⚠等非GBK字符会抛UnicodeEncodeError导致下载中断，
+       统一设置 errors='replace' 避免崩溃；
+    2. 无控制台打包环境(console=False)中 stdout/stderr 为None，print会抛AttributeError，
+       用空写入器兜底。
+    应在程序入口(gui.py/main.py)最开头调用。
+    """
+    class _NullWriter:
+        def write(self, s):
+            pass
+        def flush(self):
+            pass
+
+    if sys.stdout is None:
+        sys.stdout = _NullWriter()
+    if sys.stderr is None:
+        sys.stderr = sys.stdout
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure:
+            try:
+                reconfigure(errors='replace')
+            except Exception:
+                pass
+
 
 def is_normal_url(url):
     """检查URL是否有效"""

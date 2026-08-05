@@ -99,6 +99,30 @@ def get_sites_requiring_login():
             if getattr(cls, 'REQUIRES_LOGIN', False)]
 
 
+def _site_supports_cookie_input(cls):
+    """站点是否需要Cookie输入：优先读SUPPORTS_COOKIE_INPUT声明，
+    未声明时默认等于REQUIRES_LOGIN（需登录的站点才需要Cookie）"""
+    if hasattr(cls, 'SUPPORTS_COOKIE_INPUT'):
+        return bool(cls.SUPPORTS_COOKIE_INPUT)
+    return getattr(cls, 'REQUIRES_LOGIN', False)
+
+
+def get_sites_supporting_cookie():
+    """获取支持Cookie输入的网站列表"""
+    sites = discover_sites()
+    return [name for name, cls in sites.items()
+            if _site_supports_cookie_input(cls)]
+
+
+def site_supports_cookie(site_name):
+    """指定站点是否需要Cookie输入"""
+    try:
+        cls = get_site_crawler_class(site_name)
+    except ValueError:
+        return False
+    return _site_supports_cookie_input(cls)
+
+
 def get_site_config(site_name):
     """获取指定网站的配置信息"""
     crawler_class = get_site_crawler_class(site_name)

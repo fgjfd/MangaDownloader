@@ -23,7 +23,11 @@ class ComicCrawler:
         self.login_mode = login_mode
         self.login_completed = False
         self.cookies_dir = cookies_dir if cookies_dir else DEFAULT_COOKIES_DIR
-        
+
+        # 未显式提供cookie_str时，尝试加载用户保存的Cookie字符串
+        if not self.cookie_str:
+            self.cookie_str = self.load_cookie_str()
+
         print(f"正在初始化浏览器...")
         co = ChromiumOptions().set_paths(browser_path)
         
@@ -36,6 +40,11 @@ class ComicCrawler:
             co.set_argument("--disable-gpu")
             co.set_argument("--no-sandbox")
             co.set_argument("--disable-dev-shm-usage")
+            # 禁用Edge SmartScreen，避免无头模式下安全拦截导致页面无法访问
+            co.set_argument("--disable-features=SmartScreen")
+            # 设置正常UA并去除自动化特征，避免被Cloudflare等反爬检测阻止fetch请求
+            co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0")
+            co.set_argument("--disable-blink-features=AutomationControlled")
             print("已启用无头模式")
         else:
             print("已启用有头模式")
@@ -45,20 +54,86 @@ class ComicCrawler:
             self.tab = self.page
         except Exception as e:
             print(f"浏览器连接失败: {e}")
-            print("尝试关闭现有浏览器进程并重新启动...")
-            import subprocess
-            try:
-                subprocess.run(['taskkill', '/F', '/IM', 'msedge.exe'], capture_output=True)
-                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
-                time.sleep(2)
-            except:
-                pass
+            print("尝试清理残留的调试浏览器进程并重新启动...")
+            self._kill_leftover_debug_browsers()
+            time.sleep(2)
             self.page = ChromiumPage(co)
             self.tab = self.page
         
         # 初始化网站爬虫实例
         self.site_crawler = self.site_crawler_class(self)
+
+        # 有Cookie字符串时自动应用（登录态），后续所有请求/标签页均生效
+        if self.cookie_str:
+            self.set_cookie()
+
+    def get_cookie_str_path(self):
+        if not os.path.exists(self.cookies_dir):
+            os.makedirs(self.cookies_dir)
+        return os.path.join(self.cookies_dir, f"{self.site_name}_cookie_str.txt")
+
+    def save_cookie_str(self, cookie_str):
+        """保存用户粘贴的Cookie字符串到文件"""
+        try:
+            cookie_str = (cookie_str or '').strip()
+            path = self.get_cookie_str_path()
+            if not cookie_str:
+                if os.path.exists(path):
+                    os.remove(path)
+                return True
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(cookie_str)
+            print(f"Cookie字符串已保存到: {path}")
+            return True
+        except Exception as e:
+            print(f"保存Cookie字符串失败: {e}")
+            return False
+
+    def load_cookie_str(self):
+        """加载已保存的Cookie字符串，无则返回None"""
+        try:
+            path = self.get_cookie_str_path()
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    s = f.read().strip()
+                if s:
+                    print(f"已从文件加载Cookie字符串: {path}")
+                    return s
+        except Exception as e:
+            print(f"加载Cookie字符串失败: {e}")
+        return None
+
+    def has_cookie_str(self):
+        return os.path.exists(self.get_cookie_str_path())
+
+    def clear_cookie_str(self):
+        try:
+            path = self.get_cookie_str_path()
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"清除Cookie字符串失败: {e}")
     
+    def _kill_leftover_debug_browsers(self):
+        """仅清理带调试端口的残留浏览器进程（上次异常退出遗留），
+        不影响用户正常使用的浏览器"""
+        import subprocess
+        import re
+        for name in ('msedge.exe', 'chrome.exe'):
+            try:
+                r = subprocess.run(
+                    ['wmic', 'process', 'where', f"name='{name}'",
+                     'get', 'ProcessId,CommandLine', '/format:csv'],
+                    capture_output=True, text=True, encoding='gbk', errors='ignore')
+                for line in r.stdout.splitlines():
+                    if 'remote-debugging-port' in line:
+                        m = re.search(r'(\d+)\s*$', line.strip())
+                        if m:
+                            subprocess.run(['taskkill', '/F', '/PID', m.group(1)],
+                                           capture_output=True)
+            except Exception:
+                pass
+
     def get_cookies_path(self):
         if not os.path.exists(self.cookies_dir):
             os.makedirs(self.cookies_dir)
@@ -111,8 +186,6 @@ class ComicCrawler:
         return True
     
     def parse_cookie_str(self, cookie_str, domain):
-        from urllib.parse import unquote
-        
         cookies = []
         items = [item.strip() for item in cookie_str.split(';') if item.strip()]
         
@@ -122,10 +195,8 @@ class ComicCrawler:
                 name = name.strip()
                 value = value.strip()
                 
-                try:
-                    value = unquote(value)
-                except:
-                    pass
+                # 注意：不能对value做unquote！浏览器发送Cookie头时保持原始编码，
+                # 解码会破坏SESSDATA等含%编码值的Cookie导致登录态失效
                 
                 cookies.append({
                     'name': name,
@@ -151,16 +222,16 @@ class ComicCrawler:
             from urllib.parse import urlparse
             
             print("正在设置Cookie...")
-            domain = urlparse(self.site_config['site_url']).netloc
+            netloc = urlparse(self.site_config['site_url']).netloc
+            # 使用主域（如 manga.bilibili.com → .bilibili.com），覆盖所有子域API请求
+            parts = netloc.split(':')[0].split('.')
+            domain = '.' + '.'.join(parts[-2:]) if len(parts) >= 2 else netloc
             
             cookies = self.parse_cookie_str(self.cookie_str, domain)
-            print(f"解析到 {len(cookies)} 个Cookie项")
+            print(f"解析到 {len(cookies)} 个Cookie项 (domain={domain})")
             
             self.tab.set.cookies(cookies)
-            print("Cookie已设置")
-            
-            self.tab.refresh()
-            print("Cookie已应用")
+            print("Cookie已设置（后续访问自动生效）")
             return True
         except Exception as e:
             print(f"设置Cookie失败: {e}")

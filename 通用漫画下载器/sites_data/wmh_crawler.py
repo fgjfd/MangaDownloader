@@ -1,25 +1,26 @@
 import time
-import re
 import threading
+from urllib.parse import quote
 
 from utils import is_normal_url
 
 
-class BaozimhCrawler:
-    """小包子漫画爬虫 (baozimh.org)"""
+class WmhCrawler:
+    """漫画1234爬虫 (m.wmh1234.com)"""
 
     # 站点元数据
-    SITE_NAME = '小包子'
-    SITE_URL = 'https://baozimh.org/'
+    SITE_NAME = '漫画1234'
+    SITE_URL = 'https://m.wmh1234.com/'
     REQUIRES_LOGIN = False
 
     # 站点配置
     CONFIG = {
-        'site_url': 'https://baozimh.org/',
+        'site_url': 'https://m.wmh1234.com/',
         'locators': {
-            'search_result': 'xpath:/html/body/main/div/div[4]/div[1]/a',
-            'cover_image': 'xpath:/html/body/main/div[2]/div[2]/div[1]/div/div[1]/div[1]/div/div/img',
-            'chapter_list_link': 'xpath:/html/body/main/div[2]/div[2]/div[2]/div[1]/div[5]/a',
+            'search_result': 'xpath:/html/body/main[1]/section[2]/div[2]/article[1]/a[1]',
+            'cover_image': 'xpath:/html/body/main[1]/section[1]/div[2]/div[1]/div[1]/img[1]',
+            'chapter_list_container': 'xpath:/html/body/main[1]/section[4]/div[1]/div[2]/div[1]',
+            'chapter_item': 'xpath:/html/body/main[1]/section[4]/div[1]/div[2]/div[1]/a',
         },
         'image_attr': 'data-src',
         'chapter_group_size': None,
@@ -29,15 +30,14 @@ class BaozimhCrawler:
         self.crawler = crawler
         self.locators = crawler.locators
         self.image_attr = crawler.image_attr
-        self._cached_chapter_urls = None  # 缓存章节列表，避免重复请求
 
     def get_cover_image(self, target_comic_tab):
-        """封面图片 - 等待加载后获取src"""
+        """封面图片 - 使用src属性（封面用src而非data-src）"""
         try:
             img_ele = target_comic_tab.ele(self.locators['cover_image'], timeout=15)
             cover_url = img_ele.attr('src')
             if not cover_url:
-                cover_url = target_comic_tab.run_js('return document.querySelector("main img.object-cover")?.src')
+                cover_url = img_ele.attr('data-src')
             print(f"封面图片URL: {cover_url}")
             return cover_url
         except Exception as e:
@@ -45,133 +45,118 @@ class BaozimhCrawler:
             return None
 
     def search_comic(self, comic_name, comic_id=None):
-        search_url = f"https://baozimh.org/s?q={comic_name}"
+        search_url = f"https://m.wmh1234.com/search?key={quote(comic_name)}"
         print(f"正在搜索漫画: {comic_name}")
         print(f"搜索URL: {search_url}")
 
-        self.crawler.tab.get(search_url)
-        time.sleep(2)
+        # 重试机制 - 处理偶发加载失败或SmartScreen拦截
+        max_retries = 3
+        href = None
+        for attempt in range(1, max_retries + 1):
+            self.crawler.tab.get(search_url)
+            time.sleep(3)
+            # 处理Edge SmartScreen警告
+            self._handle_smartscreen(self.crawler.tab)
+            try:
+                result_ele = self.crawler.tab.ele(self.locators['search_result'], timeout=15)
+                href = result_ele.attr('href')
+                if href:
+                    break
+            except Exception as e:
+                print(f"第{attempt}次搜索未找到结果: {e}")
+                if attempt < max_retries:
+                    time.sleep(2)
 
-        result_ele = self.crawler.tab.ele(self.locators['search_result'], timeout=10)
-        href = result_ele.attr('href')
+        if not href:
+            raise Exception(f"搜索'{comic_name}'失败，已重试{max_retries}次")
         print(f"搜索结果链接: {href}")
 
         target_comic_tab = self.crawler.page.new_tab(href)
+        time.sleep(3)
+        # 处理Edge SmartScreen警告
+        self._handle_smartscreen(target_comic_tab)
         return target_comic_tab
 
-    def _fetch_chapters_via_api(self, target_comic_tab):
-        """用run_js执行fetch请求获取章节列表（无头模式下Alpine.js不渲染DOM，需用API）"""
-        try:
-            # 获取章节目录页URL
-            chapterlist_url = target_comic_tab.url
-            if '/chapterlist/' not in chapterlist_url:
-                # 不在章节目录页，先找链接导航
-                chapterlist_link = target_comic_tab.ele(self.locators['chapter_list_link'], timeout=5)
-                if chapterlist_link:
-                    chapterlist_url = chapterlist_link.attr('href')
-                    if chapterlist_url and not chapterlist_url.startswith('http'):
-                        chapterlist_url = f"https://baozimh.org{chapterlist_url}"
-                else:
-                    # 从详情页URL提取manga_slug构造章节目录页URL
-                    parts = chapterlist_url.rstrip('/').split('/')
-                    manga_slug = parts[-1] if parts else ''
-                    chapterlist_url = f"https://baozimh.org/chapterlist/{manga_slug}"
-
-            print(f"导航到章节目录页: {chapterlist_url}")
-            self.crawler.tab.get(chapterlist_url)
-            time.sleep(2)
-
-            # 用run_js从#allchapters获取mid，再fetch API获取章节列表
-            js_code = """
-            return new Promise((resolve) => {
-                const el = document.getElementById('allchapters');
-                if (!el) { resolve(JSON.stringify({error: 'allchapters not found'})); return; }
-                const mid = el.getAttribute('data-mid');
-                if (!mid) { resolve(JSON.stringify({error: 'data-mid not found'})); return; }
-                fetch('https://v2.apikk.top/api/manga/get?mid=' + mid + '&mode=all')
-                    .then(r => r.json())
-                    .then(data => resolve(JSON.stringify(data)))
-                    .catch(e => resolve(JSON.stringify({error: e.message})));
-            });
-            """
-            result = self.crawler.tab.run_js(js_code, as_expr=False, timeout=30)
-            if not result:
-                print("run_js返回空")
-                return []
-
-            import json
-            body = json.loads(result)
-            if 'error' in body:
-                print(f"获取章节列表失败: {body['error']}")
-                return []
-
-            data = body.get('data', {})
-            manga_slug = data.get('slug', '')
-            chapters = data.get('chapters', [])
-
-            # API返回章节已按order从旧到新排列
-            chapter_urls = []
-            for ch in chapters:
-                attrs = ch.get('attributes', {})
-                slug = attrs.get('slug', '')
-                title = attrs.get('title', f"第{len(chapter_urls)+1}章")
-                if slug:
-                    url = f"https://baozimh.org/manga/{manga_slug}/{slug}"
-                    chapter_urls.append({
-                        'num': len(chapter_urls) + 1,
-                        'url': url,
-                        'title': title
-                    })
-
-            print(f"从API获取 {len(chapter_urls)} 个章节")
-            return chapter_urls
-        except Exception as e:
-            print(f"从API获取章节列表失败: {e}")
-            return []
-
     def get_chapter_count(self, target_comic_tab):
-        """获取章节数 - 用listen监听API获取章节列表"""
+        """获取章节数 - 章节列表已完整加载，无需展开"""
         try:
-            chapter_urls = self._fetch_chapters_via_api(target_comic_tab)
-            self._cached_chapter_urls = chapter_urls
-            count = len(chapter_urls)
-            print(f"检测到 {count} 个章节")
+            all_a = target_comic_tab.eles(self.locators['chapter_item'], timeout=20)
+            total = len(all_a)
+            # a[1]是"APP观看"推广链接，非章节，需排除
+            count = total - 1 if total > 0 else 0
+            print(f"检测到 {count} 个章节（排除1个APP推广链接）")
             return count
         except Exception as e:
             print(f"获取章节数失败: {e}")
-        return 0
+            return 0
 
     def _get_chapter_urls_from_page(self, target_comic_tab):
-        """获取章节URL列表，按从旧到新排列"""
-        # 优先使用缓存（get_chapter_count已获取过）
-        if self._cached_chapter_urls is not None:
-            print(f"使用缓存的章节列表: {len(self._cached_chapter_urls)} 个")
-            return self._cached_chapter_urls
+        """从章节列表获取所有章节URL，按从旧到新排列 - xpath遍历方式
 
-        chapter_urls = self._fetch_chapters_via_api(target_comic_tab)
-        self._cached_chapter_urls = chapter_urls
+        注意：a[1]是"APP观看"推广链接，需从a[2]开始遍历
+        章节顺序已是从旧到新，无需reversed()
+        """
+        chapter_urls = []
+
+        try:
+            # 1. 先获取所有a元素，确定数量
+            all_a = target_comic_tab.eles(self.locators['chapter_item'], timeout=20)
+            total = len(all_a)
+            print(f"找到 {total} 个a元素")
+
+            if total > 1:
+                # 2. 从a[2]开始遍历（跳过a[1]的APP推广链接）
+                for i in range(2, total + 1):
+                    try:
+                        a_ele = target_comic_tab.ele(
+                            f'xpath:/html/body/main[1]/section[4]/div[1]/div[2]/div[1]/a[{i}]',
+                            timeout=5
+                        )
+                        href = a_ele.attr('href')
+                        title = a_ele.text.strip() if a_ele.text else f"第{len(chapter_urls) + 1}章"
+                        if href and '/go/' in href:
+                            chapter_urls.append({
+                                'num': len(chapter_urls) + 1,
+                                'url': href,
+                                'title': title
+                            })
+                    except Exception as e:
+                        print(f"提取第{i}个a元素失败: {e}")
+
+        except Exception as e:
+            print(f"从页面获取章节URL失败: {e}")
+
         print(f"共获取 {len(chapter_urls)} 个章节URL")
         return chapter_urls
 
     def get_chapter_image_urls(self, chapter_tab):
-        """从章节页面提取所有图片URL - xpath遍历方式"""
+        """从章节页面提取所有图片URL - xpath遍历方式
+
+        图片在 /html/body/main[1]/img[N]，URL在data-src属性
+        data-src已在SSR HTML中，无需滚动触发懒加载
+        """
         herf_list = []
 
         try:
             time.sleep(2)
 
-            # 1. 先获取图片容器元素，确定数量
-            img_containers = chapter_tab.eles('xpath:/html/body/main/section/div/div/div[4]/div/div[1]/div/div', timeout=10)
+            # 1. 先获取图片元素，确定数量
+            img_containers = chapter_tab.eles('xpath:/html/body/main[1]/img', timeout=10)
             total_imgs = len(img_containers)
-            print(f"找到 {total_imgs} 个图片容器")
+            print(f"找到 {total_imgs} 个图片元素")
 
             if total_imgs > 0:
-                # 2. 遍历每个容器，获取其中的img
+                # 2. 遍历每个img，获取data-src
                 for i in range(1, total_imgs + 1):
                     try:
-                        img_ele = chapter_tab.ele(f'xpath:/html/body/main/section/div/div/div[4]/div/div[1]/div/div[{i}]/img', timeout=5)
+                        img_ele = chapter_tab.ele(
+                            f'xpath:/html/body/main[1]/img[{i}]',
+                            timeout=5
+                        )
                         src = img_ele.attr('data-src')
-                        if src and is_normal_url(src):
+                        if not src:
+                            src = img_ele.attr('src')
+                        if src and is_normal_url(src) and 'placeholder' not in src:
                             herf_list.append(src)
                         else:
                             print(f"第{i}张图片URL无效: {src}")
@@ -185,6 +170,19 @@ class BaozimhCrawler:
 
         return herf_list
 
+    def _handle_smartscreen(self, tab):
+        """处理Edge SmartScreen安全警告 - 自动点击'不阻止此站点'"""
+        try:
+            btn = tab.ele('text:不阻止', timeout=3)
+            if btn:
+                print("检测到Edge SmartScreen警告，点击'不阻止此站点'")
+                btn.click()
+                time.sleep(3)
+                return True
+        except:
+            pass
+        return False
+
     def collect_chapter_images(self, chapter_info, max_wait_time=5):
         chapter_num = chapter_info['chapter_num']
         chapter_url = chapter_info['url']
@@ -194,15 +192,19 @@ class BaozimhCrawler:
 
         try:
             chapter_tab = main_tab.new_tab(chapter_url)
-            time.sleep(2)
+            time.sleep(3)
+
+            # 处理Edge SmartScreen警告
+            self._handle_smartscreen(chapter_tab)
 
             # 等待章节内容加载 - 重试机制
+            # /go/链接会重定向到 reader.hqread.cc 阅读页
             retry_count = 0
             max_retries = 3
 
             while retry_count <= max_retries:
                 try:
-                    img_containers = chapter_tab.eles('xpath:/html/body/main/section/div/div/div[4]/div/div[1]/div/div', timeout=5)
+                    img_containers = chapter_tab.eles('xpath:/html/body/main[1]/img', timeout=5)
                     if len(img_containers) > 0:
                         print(f"章节{chapter_num}检测到{len(img_containers)}张图片")
                         break
@@ -213,7 +215,8 @@ class BaozimhCrawler:
                     retry_count += 1
                     print(f"章节{chapter_num} 未检测到图片，第{retry_count}次重新加载...")
                     chapter_tab.get(chapter_url)
-                    time.sleep(2)
+                    time.sleep(3)
+                    self._handle_smartscreen(chapter_tab)
                 else:
                     print(f"章节{chapter_num} 已达最大重试次数({max_retries})")
                     chapter_tab.close()
@@ -234,7 +237,8 @@ class BaozimhCrawler:
             'herf_list': herf_list
         }
 
-    def collect_chapters_images(self, target_comic_tab, chapter_start=1, chapter_end=0, max_threads=3, progress_callback=None):
+    def collect_chapters_images(self, target_comic_tab, chapter_start=1, chapter_end=0, max_threads=3,
+                                progress_callback=None):
         print(f"设置最大同时收集线程数: {max_threads}")
 
         # 获取章节URL列表

@@ -29,7 +29,9 @@
 - **章节排序**：目录页从新到旧需`reversed()`？从旧到新直接用？
 - **JS渲染**：章节/图片是SSR直接在HTML中，还是JS动态渲染需等待？
 - **是否需要滚动**：图片是否需要滚动触发懒加载？还是`data-src`已在HTML中？
+- **图片是否加密**：用requests直接下载一张图片，若Content-Type为`binary/octet-stream`、文件头是随机字节（不是`FFD8FF`/`89504E47`等图片魔数）、浏览器内img的src被替换为`blob:`URL → 站点图片被加密，需启用**浏览器渲染下载模式**（见"特殊站点策略"章节）
 - **是否需要登录**：`REQUIRES_LOGIN`
+- **是否需要Cookie输入**：登录态对下载内容有影响（如解锁已购章节）时声明`SUPPORTS_COOKIE_INPUT = True`，GUI才会显示Cookie输入行；未声明时默认等于`REQUIRES_LOGIN`
 - **下载模式**：`download_mode` = `thread_only`（纯多线程）或 `coroutine`（协程）
 - **代理需求**：图片CDN是否需要代理？CONFIG中设置proxy
 
@@ -55,6 +57,7 @@ class XxxCrawler:
     SITE_NAME = '显示名'       # GUI下拉框显示的名称
     SITE_URL = 'https://...'   # 站点首页URL
     REQUIRES_LOGIN = False     # 是否需要登录
+    # SUPPORTS_COOKIE_INPUT = True  # 可选：登录非必需但支持Cookie输入（如解锁已购章节）
 
     # ========== 配置（必填）==========
     CONFIG = {
@@ -91,6 +94,7 @@ class XxxCrawler:
 | `SITE_NAME` | str | GUI中显示的站点名（如"G社漫画"） |
 | `SITE_URL` | str | 站点首页URL（如"https://m.g-mh.org/"） |
 | `REQUIRES_LOGIN` | bool | 是否需要登录（默认False） |
+| `SUPPORTS_COOKIE_INPUT` | bool | 可选：GUI是否显示Cookie输入行（默认等于REQUIRES_LOGIN；登录非必需但Cookie有用时显式设True，如哔哩哔哩漫画） |
 
 ---
 
@@ -107,6 +111,10 @@ CONFIG = {
     },
     'image_attr': 'data-src',            # 图片URL属性名（常见：src, data-src, data-path）
     'chapter_group_size': None,          # 章节分组大小（通常为None）
+    # ==== 以下为图片加密站点专用（普通站点不需要）====
+    # 'browser_render': True,             # 启用浏览器渲染下载模式
+    # locators中需额外提供：
+    # 'chapter_image': 'xpath:...',       # 章节阅读页图片img定位器
 }
 ```
 
@@ -217,6 +225,7 @@ def get_chapter_count(self, target_comic_tab):
   ```python
   [{'chapter_num': 1, 'herf_list': ['url1', 'url2', ...]}, ...]
   ```
+- **重要**：若站点启用`browser_render`模式，每个元素**必须**额外包含`'url': 章节页URL`字段，下载器需要它打开章节页提取图片
 
 **实现模板**：
 ```python
@@ -518,3 +527,148 @@ crawler.page.quit()
 
 ### 框架特性
 - Astro/Alpine.js站点章节已在SSR HTML中，不需要等JS渲染
+
+---
+
+## 特殊站点策略
+
+### 加密图片站点（浏览器渲染下载模式）
+
+**适用场景**：站点对图片做了前端加密（如AES），HTTP直接下载`data-src`得到的是密文，保存后无法打开；站点JS在浏览器内解密后把img的src替换为`blob:`URL。
+
+**如何判断**：
+1. 用requests直接请求一张图片URL：HTTP 200但Content-Type是`binary/octet-stream`，文件头是随机字节（非图片魔数）
+2. 用DrissionPage打开章节页，对比`data-src`与实际`src`：实际src是`blob:https://...`开头
+
+**接入方式（零代码，只需配置）**：下载逻辑已通用化在`downloader.py`（`download_chapters_via_browser`等），站点爬虫无需写任何下载代码，只需：
+
+```python
+CONFIG = {
+    'site_url': 'https://...',
+    'locators': {
+        # ...其他定位器...
+        'chapter_image': 'xpath:/html/body/.../img',  # 章节阅读页图片img定位器（必填）
+    },
+    'image_attr': 'data-src',
+    'chapter_group_size': None,
+    'browser_render': True,   # 声明启用浏览器渲染下载（开关）
+}
+```
+
+同时`collect_chapter_images`返回的章节数据必须包含`'url': chapter_url`字段（收集章节页URL）。
+
+**框架自动完成的事**：
+1. `download_all_chapters`检测到`browser_render=True`，自动切换到浏览器渲染下载分支
+2. 按GUI线程数（`download_thread_count`）用`ThreadPoolExecutor`同时打开多个章节标签页并行提取
+3. 每个线程：`new_tab(章节URL)` → 等待图片元素 → 分步`run_js('window.scrollTo(...)')`触发懒加载解密 → 等待src变为`blob:`/`data:image` → canvas `drawImage`+`toDataURL('image/jpeg', 0.92)`提取像素 → 保存`{i}.jpg`
+4. 失败整章自动重试2次，失败列表与普通下载格式一致（写入`failed_images.json`、不压缩zip）
+5. 封面同样优先浏览器提取（`download_cover_via_browser`），失败自动回退HTTP下载
+
+**注意事项**：
+- **失败列表无法HTTP重试**：`failed_images.json`里的URL是加密链接，"重新下载失败图片"功能对其无效，需重新下载该章节
+- **canvas跨域限制（tainted canvas）**：占位图未替换前导出会抛SecurityError，所以必须等src变为`blob:`/`data:image`再导出（框架已处理）
+- **速度**：浏览器模式比HTTP慢（实测147张/章约45秒，3章并行提速约2.5倍），并发数建议不超过8（标签页多内存占用大）
+- **滚动不要用`page.scroll.to('50%')`**：DrissionPage无此方法，用`run_js('window.scrollTo(0, document.body.scrollHeight * x)')`
+- **无头模式可用**：浏览器渲染下载复用ComicCrawler的浏览器实例，headless参数照常生效，canvas导出在无头模式下正常工作
+- **参考实现**：`sites_data/manwa_crawler.py`（漫蛙漫画 manwaqb.cc）
+
+### 无img元素加密站点（blob钩子模式，render_mode='blob_hook'）
+
+**适用场景**：比上述更极端的加密站点——解密后**根本不用img元素**，直接绘制到canvas（`canvas.toDataURL`也可能被限制），无法通过img定位器提取。典型：哔哩哔哩漫画（ECDH密钥交换加密 + canvas渲染）。
+
+**如何判断**：
+1. 章节阅读页DOM中没有任何漫画内容`img`元素，只有`canvas`
+2. `canvas.toDataURL()`返回undefined或报错
+3. 网络层抓到的图片文件头是随机字节（密文），请求中含密钥交换参数（如公钥）
+
+**原理**：无论站点如何渲染，解密后的图片二进制最终都会经过`URL.createObjectURL`生成blob URL。在页面脚本执行前注入钩子劫持该API，即可捕获所有解密后的明文图片blob，再用`fetch(blobUrl)`提取字节。
+
+**接入方式（配置 + 少量站点JS）**：
+
+```python
+CONFIG = {
+    'site_url': 'https://...',
+    'locators': {
+        'search_result': 'css:...',
+        'cover_image': 'css:...',
+        'chapter_item': 'css:...',
+        'chapter_image': None,   # blob模式无img元素
+    },
+    'image_attr': 'src',
+    'browser_render': True,
+    'render_mode': 'blob_hook',      # 声明blob钩子模式（默认canvas）
+    'cover_via_browser': False,      # 封面若为明文可声明False直接HTTP下载
+    'blob_hook': {
+        'prev_page_js': "...回退一页的点击JS...",   # 用于回到第1页
+        'next_page_js': "...前进一页的点击JS...",   # 翻页触发解密
+        'page_info_js': "...返回[当前页,总页数]的JS...",
+        'min_blob_size': 30000,   # 过滤UI小图
+        'ready_wait': 8,          # 章节页加载等待
+        'page_interval': 0.8,     # 翻页间隔
+        'max_stuck': 3,           # 翻页停滞容忍
+    },
+}
+```
+
+站点爬虫需额外提供：
+1. **类属性`BLOB_HOOK_JS`**：createObjectURL钩子脚本（可照抄bilibili_crawler.py的模板）
+2. **可选方法`prepare_blob_download(self)`**：下载前调用一次的准备逻辑（如清除阅读进度）
+3. **`collect_chapters_images`**：blob模式下`herf_list`可为空列表，但每项必须含`chapter_num`和`url`
+
+**框架自动完成的事**（downloader.py `_browser_process_chapter_blob`）：
+1. `new_tab('about:blank')` → `run_cdp('Page.addScriptToEvaluateOnNewDocument', source=BLOB_HOOK_JS)` → 导航到章节页（钩子必须在页面脚本前注入，所以先开空白页）
+2. 读取页码，若不在第1页（阅读进度恢复）自动回退
+3. 循环点击翻页直到末页，触发所有页面解密
+4. 收集捕获的blob（URL去重 + 尺寸过滤）→ fetch提取base64 → **MD5内容去重**（双缓冲/预加载会产生同页重复blob）→ 按文件头识别扩展名保存
+5. 多章节ThreadPoolExecutor并行，整章失败自动重试2次
+
+**注意事项与坑**：
+- **钩子注入时机**：必须`new_tab('about:blank')`后先`run_cdp`注入再`get(url)`；直接`new_tab(章节URL)`会错过注入时机
+- **阅读进度**：站点可能把上次阅读位置存进localStorage/indexedDB，导致打开章节直接跳到中间页。最佳方案：下载前清除对应存储（见bilibili的`prepare_blob_download`）；框架也会用prev_page_js兜底回退
+- **图片数≠页码数**：阅读器页码可能按“对开页”计数（如B站横向双页模式，1页=2张图），实际提取数约为页码2倍，这是正常现象不是重复（可用感知哈希验证内容唯一性）
+- **翻页方式**：滚动不一定有效（横向翻页模式无滚动条），优先找翻页按钮/箭头元素点击；若点击不生效可试键盘方向键（DrissionPage键名如`'RIGHT'`）
+- **listen.wait超时返回False不是None**：`page.listen.wait(timeout=n)`超时返回bool，需`if packet is None or isinstance(packet, bool)`判断
+- **外部混淆JS不要直接run_js执行**：JSVMP类解密脚本依赖特定执行环境，注入执行会报错；优先用钩子截获解密结果而非复现解密
+- **参考实现**：`sites_data/bilibili_crawler.py`（哔哩哔哩漫画）
+
+### 广告密集型站点（如漫蛙漫画 manwaqb.cc）
+- **页面加载超时**：广告脚本导致页面永远处于`busy`状态，Chrome MCP的`evaluate_script`会超时
+- **应对方案**：
+  1. 放弃用Chrome MCP的`evaluate_script`计算xpath，改用Python `requests`+`lxml`获取HTML源码计算xpath
+  2. DrissionPage的`tab.get(url)`虽然超时，但SSR内容已在DOM中，`ele()`/`eles()`仍可正常工作
+  3. 在`get_chapter_image_urls`等方法中加`time.sleep()`等待SSR内容渲染
+- **xpath计算替代方案**：
+  ```python
+  import requests
+  from lxml import etree
+  resp = requests.get(url, headers=headers)
+  tree = etree.HTML(resp.text)
+  tree_obj = etree.ElementTree(tree)
+  elements = tree.xpath('//div[@class="target"]')
+  xpath_str = tree_obj.getpath(elements[0])  # 得到完整xpath
+  ```
+
+### 非标准图片属性
+- **`data-r-src`**：漫蛙漫画的自定义懒加载属性，非标准`data-src`/`data-original`
+- **CONFIG中直接配置**：`'image_attr': 'data-r-src'`，框架会自动使用该属性
+- **封面属性不同**：漫蛙封面用`data-original`，章节用`data-r-src`，需重写`get_cover_image`
+
+### 占位图过滤
+- **问题**：懒加载图片的`src`属性是占位图（如`imagecover3.jpg`），`data-r-src`才是真实URL
+- **方案**：在提取图片URL时排除占位图：
+  ```python
+  if src and is_normal_url(src) and 'imagecover' not in src:
+      herf_list.append(src)
+  ```
+
+### 相对URL处理
+- **问题**：部分站点搜索结果href是相对路径（如`/book/47471`）
+- **方案**：统一拼接为完整URL：
+  ```python
+  if href and not href.startswith('http'):
+      href = f"https://manwaqb.cc{href}"
+  ```
+
+### HTML双body标签
+- **问题**：漫蛙漫画HTML中有两个`<body>`标签（非标准HTML），lxml和浏览器解析结果可能不同
+- **应对**：lxml计算的xpath以`/html/body/`开头仍可正常工作，因为浏览器会合并双body标签的内容到第一个body下

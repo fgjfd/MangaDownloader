@@ -5,8 +5,9 @@ import subprocess
 from functools import partial
 
 # 隐藏子进程的控制台窗口
+# errors='ignore'兜底：部分系统进程（cmd/wmic）输出GBK，强制utf-8解码会在后台线程崩溃
 CREATE_NO_WINDOW = 0x08000000
-subprocess.Popen = partial(subprocess.Popen, encoding='utf-8', creationflags=CREATE_NO_WINDOW)
+subprocess.Popen = partial(subprocess.Popen, encoding='utf-8', errors='ignore', creationflags=CREATE_NO_WINDOW)
 
 import execjs
 from lxml import etree
