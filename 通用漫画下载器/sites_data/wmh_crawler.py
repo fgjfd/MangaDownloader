@@ -222,6 +222,7 @@ class WmhCrawler:
                     chapter_tab.close()
                     return {
                         'chapter_num': chapter_num,
+                        'title': chapter_info.get('title', ''),
                         'herf_list': []
                     }
 
@@ -234,6 +235,7 @@ class WmhCrawler:
 
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
 
@@ -273,6 +275,7 @@ class WmhCrawler:
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': chapter_urls[num - 1].get('title', ''),
                     'main_tab': self.crawler.tab
                 })
 

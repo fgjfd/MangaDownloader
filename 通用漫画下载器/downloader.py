@@ -55,12 +55,186 @@ def get_system_proxy():
     return None
 
 
-# 全局代理设置（启动时获取一次）
-_SYSTEM_PROXY = get_system_proxy()
-if _SYSTEM_PROXY:
-    print(f"检测到系统代理: {_SYSTEM_PROXY}")
-else:
-    print("未检测到系统代理，将直连下载")
+# 全局代理设置：惰性检测（不再模块导入时同步执行，避免阻塞软件启动；
+# 由 GUI 窗口显示后在后台线程预检测，或首次下载时自动检测）
+_SYSTEM_PROXY = None
+_SYSTEM_PROXY_CHECKED = False
+_SYSTEM_PROXY_LOCK = threading.Lock()
+
+
+def get_active_proxy():
+    """获取当前系统代理（惰性检测+缓存，线程安全）
+
+    首次调用时读取注册表并缓存结果；GUI 在窗口显示后启动后台线程
+    预检测，下载函数在需要时兜底调用。
+    """
+    global _SYSTEM_PROXY, _SYSTEM_PROXY_CHECKED
+    if not _SYSTEM_PROXY_CHECKED:
+        with _SYSTEM_PROXY_LOCK:
+            if not _SYSTEM_PROXY_CHECKED:
+                _SYSTEM_PROXY = get_system_proxy()
+                _SYSTEM_PROXY_CHECKED = True
+                if _SYSTEM_PROXY:
+                    print(f"检测到系统代理: {_SYSTEM_PROXY}")
+                else:
+                    print("未检测到系统代理，将直连下载")
+    return _SYSTEM_PROXY
+
+
+# 活跃Referer：部分CDN有防盗链（缺Referer返回500或重定向到占位图），
+# 站点在CONFIG声明image_referer后，下载前由流程设置
+_ACTIVE_REFERER = None
+
+# 活跃解密器：站点CONFIG声明decrypt后，下载的字节先解密再写盘
+# （图片加密但解密可复现的站点，如喜漫漫画：AES-CBC + 固定key）
+_ACTIVE_DECRYPTOR = None
+
+# 解密后图片扩展名（无解密器时为jpg）
+_ACTIVE_IMAGE_EXT = 'jpg'
+
+# 活跃图片文件名补零位数：0=不补零(1,2,3...)，3=三位补零(001,002,003...)
+# 由GUI/CLI在下载前通过set_active_name_padding设置（持久化于config.json）
+_ACTIVE_NAME_PADDING = 0
+
+# 活跃章节文件夹命名模式：'number'=数字命名(1,2,3...)；'title'=章节名命名(1 第1话 xxx)
+# 由GUI/CLI在下载前通过set_active_chapter_folder_naming设置（持久化于config.json）
+_ACTIVE_CHAPTER_FOLDER_NAMING = 'number'
+
+
+def set_active_name_padding(padding):
+    """设置当前下载任务的图片文件名补零位数（传0/None不补零）"""
+    global _ACTIVE_NAME_PADDING
+    try:
+        _ACTIVE_NAME_PADDING = max(0, int(padding or 0))
+    except (TypeError, ValueError):
+        _ACTIVE_NAME_PADDING = 0
+
+
+def set_active_chapter_folder_naming(mode):
+    """设置当前下载任务的章节文件夹命名模式（'number'/'title'，传None保持默认数字命名）"""
+    global _ACTIVE_CHAPTER_FOLDER_NAMING
+    _ACTIVE_CHAPTER_FOLDER_NAMING = 'title' if mode == 'title' else 'number'
+
+
+def sanitize_folder_name(name):
+    """清洗文件夹名称：替换Windows非法字符，压缩空白，去除首尾空格/点"""
+    import re
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', ' ', str(name))
+    name = re.sub(r'\s+', ' ', name).strip(' .')
+    return name
+
+
+def chapter_folder_name(chapter_data):
+    """按当前命名规则生成章节文件夹名
+
+    - 'number'模式：返回章节号（如 '3'），与原版行为一致
+    - 'title'模式：返回 '章节号 章节名'（如 '3 第3话 初次相遇'），
+      章节名为空/非法时自动回退为章节号，避免空名或重名冲突
+    """
+    num = chapter_data.get('chapter_num', 0)
+    if _ACTIVE_CHAPTER_FOLDER_NAMING == 'title':
+        title = sanitize_folder_name(chapter_data.get('title') or '')
+        if title:
+            return f"{num} {title}"
+    return str(num)
+
+
+def format_image_name(index, ext):
+    """按当前命名规则生成图片文件名（如 format_image_name(3, '.jpg') -> '003.jpg'）"""
+    if _ACTIVE_NAME_PADDING > 0:
+        return f"{index:0{_ACTIVE_NAME_PADDING}d}{ext}"
+    return f"{index}{ext}"
+
+
+def set_active_referer(referer):
+    """设置当前下载任务的Referer（传None清除）"""
+    global _ACTIVE_REFERER
+    _ACTIVE_REFERER = referer or None
+
+
+def set_active_decryptor(decryptor, image_ext='jpg'):
+    """设置当前下载任务的解密函数 data->data（传None清除）"""
+    global _ACTIVE_DECRYPTOR, _ACTIVE_IMAGE_EXT
+    _ACTIVE_DECRYPTOR = decryptor or None
+    _ACTIVE_IMAGE_EXT = image_ext or 'jpg'
+
+
+def _decrypt_content(content):
+    """下载字节解密（无解密器时原样返回）。解密失败返回None"""
+    if not _ACTIVE_DECRYPTOR:
+        return content
+    try:
+        decrypted = _ACTIVE_DECRYPTOR(content)
+        if decrypted and len(decrypted) > 0:
+            return decrypted
+        print("  ✗ 解密结果为空")
+        return None
+    except Exception as e:
+        print(f"  ✗ 解密失败: {e}")
+        return None
+
+
+def _build_decryptor(site_crawler):
+    """根据站点CONFIG['decrypt']构造解密函数，无配置返回None
+
+    支持两种模式：
+    - 'aes_cbc': {'mode': 'aes_cbc', 'base64_key': '...', 'iv_prefix': 16}
+        密钥 = base64解码(base64_key)；iv = 密文前iv_prefix字节；其余为密文；
+        AES-CBC + PKCS7 解密
+    - 'site_func': 调用站点爬虫的 get_decryptor() 返回自定义函数
+    """
+    if site_crawler is None:
+        return None
+    cfg = getattr(site_crawler, 'CONFIG', {}).get('decrypt')
+    if not cfg:
+        return None
+    mode = cfg.get('mode')
+    if mode == 'site_func':
+        fn = getattr(site_crawler, 'get_decryptor', None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception as e:
+                print(f"构建解密器失败: {e}")
+        return None
+    if mode == 'aes_cbc':
+        try:
+            import base64
+            from Crypto.Cipher import AES
+            from Crypto.Util.Padding import unpad
+            key = base64.b64decode(cfg['base64_key'])
+            iv_len = cfg.get('iv_prefix', 16)
+            convert = cfg.get('convert')  # None / 'jpeg'（转码兼容不支持webp的阅读器）
+            def decrypt(data):
+                iv = data[:iv_len]
+                ciphertext = data[iv_len:]
+                cipher = AES.new(key, AES.MODE_CBC, iv)
+                plain = unpad(cipher.decrypt(ciphertext), AES.block_size)
+                if convert == 'jpeg':
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(plain))
+                        buf = io.BytesIO()
+                        img.convert('RGB').save(buf, 'JPEG', quality=92)
+                        return buf.getvalue()
+                    except Exception as e:
+                        print(f"  ✗ 转码JPEG失败（保留原格式）: {e}")
+                        return plain
+                return plain
+            return decrypt
+        except Exception as e:
+            print(f"构建AES解密器失败: {e}")
+            return None
+    print(f"未知解密模式: {mode}")
+    return None
+
+
+def _build_download_headers():
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    if _ACTIVE_REFERER:
+        headers['Referer'] = _ACTIVE_REFERER
+    return headers
 
 
 # ==================== 浏览器渲染下载（适用于图片加密、HTTP直下无效的站点） ====================
@@ -138,7 +312,7 @@ def _browser_extract_chapter_images(chapter_tab, folder_name, chapter_num, img_l
     _browser_scroll_to_load_all(chapter_tab, total_imgs)
 
     for i in range(1, total_imgs + 1):
-        file_path = os.path.join(folder_name, f"{i}.jpg")
+        file_path = os.path.join(folder_name, format_image_name(i, '.jpg'))
         img_ele = chapter_tab.ele(f'{img_locator}[{i}]', timeout=5)
         if not img_ele:
             failed.append(_browser_fail_info(chapter_num, i, folder_name, file_path, '元素不存在'))
@@ -194,7 +368,10 @@ def download_chapters_via_browser(site_crawler, all_chapters_data, comic_name, b
 
     if render_mode == 'blob_hook':
         # blob钩子模式：翻页遍历阅读器捕获解密后blob（无img元素的canvas渲染站点）
-        print(f"浏览器blob钩子下载: 共{total_chapters}章，并行标签页数: {max_workers}")
+        # 强制串行：不可见的后台标签页rAF被节流到~1Hz，阅读器翻页会卡死，
+        # 并行多标签无法保证每个标签都在前台，故串行+翻页前激活标签页
+        max_workers = 1
+        print(f"浏览器blob钩子下载: 共{total_chapters}章，串行标签页模式（阅读器需保持可见）")
         prepare = getattr(site_crawler, 'prepare_blob_download', None)
         if callable(prepare):
             try:
@@ -279,7 +456,7 @@ def _browser_process_chapter(site_crawler, chapter_data, main_folder, img_locato
         print(f"[章节{chapter_num}] 无章节URL，跳过")
         return []
 
-    folder_name = os.path.join(main_folder, str(chapter_num))
+    folder_name = os.path.join(main_folder, chapter_folder_name(chapter_data))
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
@@ -308,7 +485,7 @@ def _browser_process_chapter(site_crawler, chapter_data, main_folder, img_locato
         except Exception as e:
             print(f"[章节{chapter_num}] 第{attempt + 1}次尝试异常: {e}")
             failed = [_browser_fail_info(chapter_num, i, folder_name,
-                                         os.path.join(folder_name, f"{i}.jpg"), '章节页加载失败')
+                                         os.path.join(folder_name, format_image_name(i, '.jpg')), '章节页加载失败')
                       for i in range(1, expected_count + 1)]
         finally:
             if chapter_tab:
@@ -330,12 +507,20 @@ def _browser_process_chapter(site_crawler, chapter_data, main_folder, img_locato
 
 # ==================== blob钩子模式（加密canvas渲染站点，如哔哩哔哩漫画） ====================
 
-# fetch blob URL并转为base64返回
+# fetch blob URL并转为base64返回；先createImageBitmap校验尺寸（漫画页宽固定680px，
+# 排除UI小图/图标等意外捕获的非页面blob；小体积真实页面不会被尺寸过滤误杀）
 BLOB_FETCH_JS = """
 async function(url) {
     try {
         var resp = await fetch(url);
-        var buf = await resp.arrayBuffer();
+        var blob = await resp.blob();
+        var bmp = await createImageBitmap(blob);
+        if (bmp.width < 300 || bmp.height < 100) {
+            bmp.close();
+            return '';
+        }
+        bmp.close();
+        var buf = await blob.arrayBuffer();
         var bytes = new Uint8Array(buf);
         var bin = '';
         var chunk = 32768;
@@ -372,12 +557,54 @@ def _blob_get_page_info(chapter_tab, page_info_js):
     return 0, 0
 
 
+def _cdp_real_click(chapter_tab, x_ratio=0.85, y_ratio=0.5):
+    """CDP级真实鼠标点击（不执行页面JS，事件isTrusted=true）
+
+    部分阅读器会过滤合成事件(dispatchEvent的isTrusted=false)，
+    CDP Input事件与真人点击等价，可穿透此类限制与主线程繁忙期。
+    """
+    try:
+        metrics = chapter_tab.run_cdp('Page.getLayoutMetrics')
+        vp = metrics.get('cssVisualViewport') or metrics.get('visualViewport') or {}
+        w = vp.get('clientWidth') or 1280
+        h = vp.get('clientHeight') or 800
+        x, y = int(w * x_ratio), int(h * y_ratio)
+        for etype in ('mousePressed', 'mouseReleased'):
+            chapter_tab.run_cdp('Input.dispatchMouseEvent', type=etype, x=x, y=y,
+                                button='left', clickCount=1)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_tab_foreground(chapter_tab):
+    """确保标签页所在窗口未最小化且标签页处于前台
+
+    实测：窗口最小化或标签页不可见时，Chrome把rAF节流到~1Hz（启动参数无法禁用，
+    属Blink页面级节流），依赖rAF的阅读器翻页/解密会卡死在第1页。
+    唯一可靠手段：保持标签页真实可见，被最小化时主动恢复窗口。
+    """
+    try:
+        win_info = chapter_tab.run_cdp('Browser.getWindowForTarget')
+        win_id = win_info.get('windowId')
+        state = (win_info.get('bounds') or {}).get('windowState')
+        if state == 'minimized' and win_id is not None:
+            chapter_tab.run_cdp('Browser.setWindowBounds', windowId=win_id,
+                                bounds={'windowState': 'normal'})
+    except Exception:
+        pass
+    try:
+        chapter_tab.set.activate()
+    except Exception:
+        pass
+
+
 def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pages,
                            progress_callback=None):
     """提取已捕获的blob并保存，内容MD5去重（双缓冲/预加载会产生重复）
 
     Returns:
-        failed: 缺失页的失败列表
+        (failed, saved_count): 缺失页的失败列表、实际保存张数
     """
     failed = []
     min_size = cfg.get('min_blob_size', 30000)
@@ -386,13 +613,15 @@ def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pag
     if not isinstance(blobs, list):
         blobs = []
 
-    # 按URL去重，只保留大图
+    # 按URL去重，只保留大图；按捕获时间排序保证页面顺序
+    # （双缓冲/预加载可能提前解码后续页，捕获顺序非严格页码序）
     seen_urls = set()
     uniq = []
     for b in blobs:
         if b.get('size', 0) >= min_size and b.get('url') and b['url'] not in seen_urls:
             seen_urls.add(b['url'])
             uniq.append(b)
+    uniq.sort(key=lambda b: b.get('at') or 0)
     print(f"[章节{chapter_num}] 捕获大blob {len(uniq)} 个（总页数 {total_pages}），开始提取...")
 
     saved_md5 = set()
@@ -411,7 +640,7 @@ def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pag
         saved_md5.add(h)
         idx += 1
         ext = _blob_image_ext(data)
-        file_path = os.path.join(folder_name, f"{idx}{ext}")
+        file_path = os.path.join(folder_name, format_image_name(idx, ext))
         with open(file_path, 'wb') as f:
             f.write(data)
         print(f"  ✓ 章节{chapter_num} 第{idx}张提取成功 ({len(data)}字节)")
@@ -422,8 +651,8 @@ def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pag
     if total_pages > 0 and idx < total_pages:
         for i in range(idx + 1, total_pages + 1):
             failed.append(_browser_fail_info(chapter_num, i, folder_name,
-                                             os.path.join(folder_name, f"{i}.jpg"), 'blob缺失'))
-    return failed
+                                             os.path.join(folder_name, format_image_name(i, '.jpg')), 'blob缺失'))
+    return failed, idx
 
 
 def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
@@ -441,7 +670,7 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
         print(f"[章节{chapter_num}] 无章节URL，跳过")
         return []
 
-    folder_name = os.path.join(main_folder, str(chapter_num))
+    folder_name = os.path.join(main_folder, chapter_folder_name(chapter_data))
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
@@ -463,6 +692,7 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
 
     failed = []
     max_retries = 2
+    prev_saved = -1
     for attempt in range(max_retries + 1):
         chapter_tab = None
         try:
@@ -470,6 +700,15 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
             chapter_tab = site_crawler.crawler.page.new_tab('about:blank')
             chapter_tab.run_cdp('Page.addScriptToEvaluateOnNewDocument',
                                 source=site_crawler.BLOB_HOOK_JS)
+            # 强制标签页保持active生命周期：并行下载时非激活标签页会被节流
+            # （rAF降到~1Hz），依赖rAF的阅读器翻页/解密会卡死在第1页
+            try:
+                chapter_tab.run_cdp('Page.setWebLifecycleState', state='active')
+            except Exception:
+                pass
+            # 阅读器依赖rAF渲染，标签页必须真实可见：窗口被最小化/标签在后台时
+            # rAF被节流到~1Hz导致翻页卡死，故加载前就确保其在前台
+            _ensure_tab_foreground(chapter_tab)
             chapter_tab.get(chapter_url)
 
             # 条件等待阅读器就绪，替代固定sleep(ready_wait)：
@@ -499,6 +738,20 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
             if total <= 0:
                 raise Exception('未检测到阅读器页码（章节可能被锁定或加载失败）')
 
+            # 诊断翻页箭头是否存在（JS查询可穿透完整渲染树，比CDP DOM浅树可靠）：
+            # 新版阅读器可能无.arrow-right或过滤合成事件，提前告警供排查
+            try:
+                arrow_info = chapter_tab.run_js(
+                    "var els=['arrow-right','right-arrow','pagedown'].map(function(c){"
+                    "var e=document.querySelector('.'+c);"
+                    "return e?[c,e.offsetParent!==null]:null;}).filter(Boolean);"
+                    "return els;", timeout=8)
+                if not arrow_info or not any(v[0] == 'arrow-right' for v in arrow_info):
+                    print(f"[章节{chapter_num}] 警告: 未检测到.arrow-right，"
+                          f"现有导航元素: {arrow_info}")
+            except Exception:
+                pass
+
             # 若不在第1页（阅读进度恢复），先回退到第1页
             stuck = 0
             while cur > 1 and stuck < max_stuck and prev_page_js:
@@ -516,7 +769,14 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
             while cur < total:
                 prev = cur
                 if stuck >= max_stuck:
-                    chapter_tab.run_js(stuck_next_js)
+                    # 停滞优先恢复前台（用户可能中途最小化了窗口，rAF节流导致翻页失效）
+                    _ensure_tab_foreground(chapter_tab)
+                    # 兜底方式交替：JS事件与CDP真实点击
+                    # （新版阅读器可能过滤isTrusted=false的合成事件，真实点击可穿透）
+                    if (stuck - max_stuck) % 2 == 0:
+                        chapter_tab.run_js(stuck_next_js)
+                    else:
+                        _cdp_real_click(chapter_tab, 0.85, 0.5)
                     time.sleep(page_interval * 2)
                     stuck_waited += page_interval * 2
                     if stuck_waited >= stuck_timeout:
@@ -530,22 +790,51 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
                 else:
                     stuck = 0
                     stuck_waited = 0.0
+
+            # 到底后尾部页面可能仍在异步解码：停在底部持续等待，
+            # 直到去重大blob数达到总页数才提前退出，否则等满tail_wait秒
+            # （"数量稳定"不可靠：解码未完成时数量同样稳定，会提前误退出）
+            tail_wait = cfg.get('tail_wait', 20)
+            tail_deadline = time.time() + tail_wait
+            tail_min_size = cfg.get('min_blob_size', 30000)
+            tail_js = ("var bs=(window.__captured_blobs||[]);var seen={};var n=0;"
+                       "for(var i=0;i<bs.length;i++){var b=bs[i];"
+                       "if(b.size>=%d&&b.url&&!seen[b.url]){seen[b.url]=1;n++;}}"
+                       "return n;" % tail_min_size)
+            while time.time() < tail_deadline:
+                time.sleep(1.5)
+                try:
+                    n = chapter_tab.run_js(tail_js) or 0
+                except Exception:
+                    n = -1
+                if n >= total:
+                    break
             time.sleep(2)
 
             if cur < total:
                 print(f"[章节{chapter_num}] 翻页停滞于 {cur}/{total}")
 
-            failed = _blob_extract_and_save(
+            traversal_done = cur >= total
+            failed, saved_count = _blob_extract_and_save(
                 chapter_tab, folder_name, chapter_num, cfg, total, progress_callback)
 
             if not failed:
                 break
+            # 翻页已完整遍历到底，且解码张数稳定：仅在差距极小（≤2张）时按"尾部
+            # 占位页"接受——真正缺页时差距较大，保持失败列表如实上报，避免静默漏图
+            if traversal_done and saved_count == prev_saved and saved_count > 0 \
+                    and total - saved_count <= 2:
+                print(f"[章节{chapter_num}] 阅读器报{total}页，实际解码{saved_count}张"
+                      f"（差距≤2，尾页占位，非缺图），按{saved_count}张完成")
+                failed = []
+                break
+            prev_saved = saved_count
             if attempt < max_retries:
                 print(f"[章节{chapter_num}] 本次缺失 {len(failed)} 张，重试中...")
         except Exception as e:
             print(f"[章节{chapter_num}] 第{attempt + 1}次尝试异常: {e}")
             failed = [_browser_fail_info(chapter_num, 1, folder_name,
-                                         os.path.join(folder_name, "1.jpg"), f'章节提取失败: {e}')]
+                                         os.path.join(folder_name, format_image_name(1, '.jpg')), f'章节提取失败: {e}')]
         finally:
             if chapter_tab:
                 try:
@@ -599,61 +888,110 @@ def is_browser_render_site(site_crawler):
 
 
 async def download_with_aiohttp(url, file_path, timeout=10, proxy=None):
-    """使用aiohttp下载"""
-    try:
-        connector = aiohttp.TCPConnector(
-            limit=1,
-            enable_cleanup_closed=True,
-            force_close=True,
-            ssl=False
-        )
+    """使用aiohttp下载（代理返回5xx时自动直连重试一次：部分CDN拒绝代理出口IP）"""
+    # 使用传入的代理或全局代理（惰性检测）
+    active_proxy = get_active_proxy()
+    proxy_url = proxy or (active_proxy.get('https') if active_proxy else None)
+    attempts = [proxy_url, None] if proxy_url else [None]
+    last_info = "未知错误"
 
-        # 使用传入的代理或全局代理
-        proxy_url = proxy or (_SYSTEM_PROXY.get('https') if _SYSTEM_PROXY else None)
+    for attempt_proxy in attempts:
+        try:
+            connector = aiohttp.TCPConnector(
+                limit=1,
+                enable_cleanup_closed=True,
+                force_close=True,
+                ssl=False
+            )
 
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as session:
-            async with session.get(url, allow_redirects=True, proxy=proxy_url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    # 只要有内容就算成功（即使是空白图片）
-                    if len(content) > 0:
-                        async with aiofiles.open(file_path, 'wb') as f:
-                            await f.write(content)
-                        return True, len(content)
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers=_build_download_headers()
+            ) as session:
+                async with session.get(url, allow_redirects=True, proxy=attempt_proxy) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        # 解密后写盘（站点CONFIG声明decrypt时）
+                        if _ACTIVE_DECRYPTOR:
+                            content = _decrypt_content(content)
+                            if content is None:
+                                return False, "解密失败"
+                        # 只要有内容就算成功（即使是空白图片）
+                        if len(content) > 0:
+                            async with aiofiles.open(file_path, 'wb') as f:
+                                await f.write(content)
+                            return True, len(content)
+                        else:
+                            return False, "内容为空"
                     else:
-                        return False, "内容为空"
-                else:
-                    return False, f"状态码{response.status}"
-    except asyncio.TimeoutError:
-        return False, "超时"
-    except Exception as e:
-        return False, str(e)[:50]
+                        if 500 <= response.status < 600:
+                            last_info = f"服务端错误(状态码{response.status})，源站文件可能已损坏，非客户端问题"
+                            if attempt_proxy:
+                                # 可能是CDN拒绝代理出口IP，改用直连重试
+                                continue
+                            return False, last_info
+                        return False, f"状态码{response.status}"
+        except asyncio.TimeoutError:
+            last_info = "超时"
+            if attempt_proxy:
+                continue
+        except Exception as e:
+            last_info = str(e)[:50]
+            if attempt_proxy:
+                continue
+
+    return False, last_info
 
 
 def download_with_requests(url, file_path, timeout=10, proxy=None):
-    """使用requests下载（同步）"""
-    try:
-        # 使用传入的代理或全局代理
-        proxies = proxy or _SYSTEM_PROXY
+    """使用requests下载（同步，代理返回5xx时自动直连重试一次）"""
+    # 使用传入的代理或全局代理（惰性检测）
+    proxies = proxy or get_active_proxy()
+    attempts = [proxies, {'http': None, 'https': None}] if proxies else [None]
+    last_info = "未知错误"
 
-        response = requests.get(url, stream=True, timeout=timeout, proxies=proxies)
-        response.raise_for_status()
-        
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(1024):
-                f.write(chunk)
-        
-        # 只要有内容就算成功（即使是空白图片）
-        file_size = os.path.getsize(file_path)
-        if file_size > 0:
-            return True, file_size
-        else:
-            return False, "内容为空"
-    except Exception as e:
-        return False, str(e)[:50]
+    for attempt_proxies in attempts:
+        try:
+            response = requests.get(url, stream=True, timeout=timeout, proxies=attempt_proxies,
+                                    headers=_build_download_headers())
+            try:
+                response.raise_for_status()
+            except requests.HTTPError:
+                if 500 <= response.status_code < 600:
+                    last_info = f"服务端错误(状态码{response.status_code})，源站文件可能已损坏，非客户端问题"
+                    if attempt_proxies:
+                        # 可能是CDN拒绝代理出口IP，改用直连重试
+                        continue
+                    return False, last_info
+                return False, f"状态码{response.status_code}"
+
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(1024):
+                    f.write(chunk)
+
+            # 解密后重写（站点CONFIG声明decrypt时）
+            if _ACTIVE_DECRYPTOR:
+                with open(file_path, 'rb') as f:
+                    raw = f.read()
+                decrypted = _decrypt_content(raw)
+                if decrypted is None:
+                    return False, "解密失败"
+                with open(file_path, 'wb') as f:
+                    f.write(decrypted)
+
+            # 只要有内容就算成功（即使是空白图片）
+            file_size = os.path.getsize(file_path)
+            if file_size > 0:
+                return True, file_size
+            else:
+                return False, "内容为空"
+        except Exception as e:
+            last_info = str(e)[:50]
+            if attempt_proxies:
+                continue
+
+    return False, last_info
 
 
 async def download_image(url, index, folder_name, chapter_num, progress_callback=None, timeout=10):
@@ -664,7 +1002,7 @@ async def download_image(url, index, folder_name, chapter_num, progress_callback
     Args:
         timeout: 下载超时时间（秒）
     """
-    file_path = os.path.join(folder_name, f"{index}.jpg")
+    file_path = os.path.join(folder_name, format_image_name(index, f".{_ACTIVE_IMAGE_EXT}"))
     
     success, info = await download_with_aiohttp(url, file_path, timeout=timeout)
     if success:
@@ -771,7 +1109,7 @@ def download_batch_thread_only(images_to_download, thread_count=8, progress_call
     
     def download_single(args):
         url, index, folder_name, chapter_num = args
-        file_path = os.path.join(folder_name, f"{index}.jpg")
+        file_path = os.path.join(folder_name, format_image_name(index, f".{_ACTIVE_IMAGE_EXT}"))
         
         # 使用requests直接下载
         success, info = download_with_requests(url, file_path, timeout=timeout)
@@ -910,7 +1248,7 @@ def check_missing_images(herf_list, folder_name, chapter_num):
     """检查哪些图片缺失或损坏"""
     missing = []
     for i, url in enumerate(herf_list, 1):
-        file_path = os.path.join(folder_name, f"{i}.jpg")
+        file_path = os.path.join(folder_name, format_image_name(i, f".{_ACTIVE_IMAGE_EXT}"))
         if not os.path.exists(file_path):
             missing.append({
                 'url': url,
@@ -953,7 +1291,8 @@ def save_image_urls_to_json(all_chapters_data, comic_name, base_path=None):
         
         chapter_info = {
             "chapter_num": chapter_num,
-            "folder_name": str(chapter_num),
+            "folder_name": chapter_folder_name(chapter_data),
+            "title": chapter_data.get('title', ''),
             "url": chapter_data.get('url', ''),
             "total_images": len(herf_list),
             "images": []
@@ -962,7 +1301,7 @@ def save_image_urls_to_json(all_chapters_data, comic_name, base_path=None):
         for i, url in enumerate(herf_list, 1):
             chapter_info["images"].append({
                 "index": i,
-                "filename": f"{i}.jpg",
+                "filename": format_image_name(i, f".{_ACTIVE_IMAGE_EXT}"),
                 "url": url
             })
         
@@ -1009,7 +1348,18 @@ async def download_all_chapters(all_chapters_data, comic_name, base_path=None, s
     if save_json_only:
         print(f"仅保存JSON，跳过下载")
         return [], None, True
-    
+
+    # 按站点CONFIG设置Referer（CDN防盗链站点需要），流程结束后清除
+    set_active_referer(getattr(site_crawler, 'CONFIG', {}).get('image_referer') if site_crawler else None)
+
+    # 按站点CONFIG设置解密器（图片加密可复现的站点），流程结束后清除
+    decrypt_cfg = getattr(site_crawler, 'CONFIG', {}).get('decrypt') if site_crawler else None
+    if decrypt_cfg:
+        decryptor = _build_decryptor(site_crawler)
+        if decryptor:
+            set_active_decryptor(decryptor, decrypt_cfg.get('ext', 'jpg'))
+            print(f"该站点启用解密下载（模式: {decrypt_cfg.get('mode')}，扩展名: {decrypt_cfg.get('ext', 'jpg')}）")
+
     total_start = time.time()
     all_failed = []  # 收集所有失败图片
 
@@ -1038,7 +1388,7 @@ async def download_all_chapters(all_chapters_data, comic_name, base_path=None, s
                 print(f"[章节{chapter_num}] 无图片链接，跳过")
                 continue
 
-            folder_name = os.path.join(main_folder, str(chapter_num))
+            folder_name = os.path.join(main_folder, chapter_folder_name(chapter_data))
             # 使用协程+多线程下载，收集所有失败
             failed = await download_chapter_images(herf_list, folder_name, chapter_num, concurrent_limit, download_thread_count, use_thread_coroutine, progress_callback, use_thread_only, timeout=first_timeout)
             # 收集所有失败图片
@@ -1076,6 +1426,8 @@ async def download_all_chapters(all_chapters_data, comic_name, base_path=None, s
         failed_json_path = save_failed_json(all_failed, comic_name, base_path,
                                                 site_name=site_name, render_mode=render_mode)
         print(f"{'='*50}")
+        set_active_referer(None)
+        set_active_decryptor(None)
         return all_failed, failed_json_path, False  # 有失败图片，不压缩
     else:
         # 全部成功，删除JSON文件
@@ -1091,6 +1443,8 @@ async def download_all_chapters(all_chapters_data, comic_name, base_path=None, s
             print(f"已删除failed_images.json（全部成功）")
     
     print(f"{'='*50}")
+    set_active_referer(None)
+    set_active_decryptor(None)
     return [], None, True  # 全部成功，可以压缩
 
 
@@ -1158,9 +1512,19 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
     print(f"漫画名称: {comic_name}")
     print(f"基础路径: {base_path}")
     print(f"待重试: {len(failed_images)} 张")
+
+    # 按失败列表记录的站点设置Referer（CDN防盗链站点需要）
+    try:
+        if data.get('site_name'):
+            from site_discovery import get_site_config
+            set_active_referer(get_site_config(data['site_name']).get('image_referer'))
+    except Exception:
+        pass
     
     if not failed_images:
         print("没有需要重试的图片")
+        set_active_referer(None)
+        set_active_decryptor(None)
         return [], True
     
     images_to_download = [
@@ -1228,8 +1592,8 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
     for chapter_num, stats in chapter_stats.items():
         folder = stats['folder']
         if os.path.exists(folder):
-            # 统计文件夹中的.jpg文件
-            actual_count = len([f for f in os.listdir(folder) if f.endswith('.jpg')])
+            # 统计文件夹中的图片文件
+            actual_count = len([f for f in os.listdir(folder) if f.endswith(f'.{_ACTIVE_IMAGE_EXT}')])
             stats['actual'] = actual_count
 
             if actual_count != stats['expected']:
@@ -1253,6 +1617,8 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
         print(f"\n更新后的失败列表已保存到: {failed_json_path}")
         
         print(f"{'='*50}")
+        set_active_referer(None)
+        set_active_decryptor(None)
         return all_failed, False
     else:
         # 全部成功，删除失败列表文件
@@ -1267,6 +1633,8 @@ async def download_from_failed_json(json_path, concurrent_limit=3, download_thre
             print(f"已删除图片URL文件: {image_urls_json}")
     
     print(f"{'='*50}")
+    set_active_referer(None)
+    set_active_decryptor(None)
     return [], True
 
 
@@ -1298,7 +1666,7 @@ def retry_failed_chapters_via_browser(json_path, site_name, browser_path, headle
     failed_chapter_nums = sorted({img['chapter_num'] for img in failed_images})
     print(f"浏览器模式重试: 漫画《{comic_name}》失败章节 {failed_chapter_nums}")
 
-    # 从image_urls.json读取章节URL
+    # 从image_urls.json读取章节URL/标题/实际文件夹名
     url_map = {}
     image_urls_json = os.path.join(main_folder, "image_urls.json")
     if os.path.exists(image_urls_json):
@@ -1307,20 +1675,24 @@ def retry_failed_chapters_via_browser(json_path, site_name, browser_path, headle
                 url_data = json.load(f)
             for chapter in url_data.get('chapters', []):
                 if chapter.get('url'):
-                    url_map[chapter['chapter_num']] = chapter['url']
+                    url_map[chapter['chapter_num']] = chapter
         except Exception as e:
             print(f"读取image_urls.json失败: {e}")
 
     chapters_data = []
     for num in failed_chapter_nums:
-        url = url_map.get(num)
-        if not url:
+        chapter = url_map.get(num)
+        if not chapter:
             print(f"章节{num}: 无章节URL，无法重试（需重新完整下载）")
             continue
-        # 清空部分残留文件，重跑后重新生成
-        folder = os.path.join(main_folder, str(num))
+        url = chapter.get('url')
+        # 使用原下载时实际使用的文件夹名（与章节命名模式一致），清空残留文件后重跑
+        folder = os.path.join(main_folder, chapter.get('folder_name') or str(num))
         shutil.rmtree(folder, ignore_errors=True)
-        chapters_data.append({'chapter_num': num, 'url': url, 'title': '', 'herf_list': []})
+        chapters_data.append({
+            'chapter_num': num, 'url': url,
+            'title': chapter.get('title', ''), 'herf_list': []
+        })
 
     if not chapters_data:
         print("没有可重试的章节")
@@ -1367,7 +1739,7 @@ async def download_cover_image(url, comic_name, base_path=None):
         os.makedirs(folder_name)
 
     print(f"\n开始下载封面...")
-    file_path = os.path.join(folder_name, "cover.jpg")
+    file_path = os.path.join(folder_name, f"cover.{_ACTIVE_IMAGE_EXT}")
     
     success, info = await download_with_aiohttp(url, file_path)
     if not success:

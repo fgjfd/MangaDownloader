@@ -11,9 +11,75 @@ import time
 import json
 from crawler import ComicCrawler
 from download_flow import run_download_flow
-from downloader import is_browser_render_site
-from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_COOKIES_DIR, CONFIG_FILE
+from downloader import is_browser_render_site, get_active_proxy
+from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_COOKIES_DIR, CONFIG_FILE, DEFAULT_IMAGE_NAME_PADDING, DEFAULT_CHAPTER_FOLDER_NAMING
 from site_discovery import get_all_site_names, get_sites_requiring_login, get_sites_supporting_cookie, get_site_download_mode, refresh_sites as _refresh_sites_cache, add_site_file as _add_site_file, add_site_folder as _add_site_folder, remove_site as _remove_site, _get_data_dir, get_all_sites_info
+
+
+# 图片命名补零选项: (显示文本, 补零位数)，默认3位在前
+NAME_PADDING_OPTIONS = [
+    ('3位（001、002...）', 3),
+    ('2位（01、02...）', 2),
+    ('4位（0001、0002...）', 4),
+    ('原样（1、2、3...）', 0),
+]
+
+
+# 章节文件夹命名选项: (显示文本, 模式值)
+CHAPTER_FOLDER_NAMING_OPTIONS = [
+    ('数字（1、2、3...）', 'number'),
+    ('章节名（1 第1话 标题...）', 'title'),
+]
+
+
+def _chapter_naming_to_label(mode):
+    """章节文件夹命名模式 -> 显示文本"""
+    for label, value in CHAPTER_FOLDER_NAMING_OPTIONS:
+        if str(value) == str(mode):
+            return label
+    return CHAPTER_FOLDER_NAMING_OPTIONS[0][0]
+
+
+def _label_to_chapter_naming(label):
+    """显示文本 -> 章节文件夹命名模式值"""
+    for text, value in CHAPTER_FOLDER_NAMING_OPTIONS:
+        if text == label:
+            return str(value)
+    return DEFAULT_CHAPTER_FOLDER_NAMING
+
+
+def _padding_to_label(padding):
+    """补零位数 -> 显示文本"""
+    for label, value in NAME_PADDING_OPTIONS:
+        if str(value) == str(padding):
+            return label
+    return NAME_PADDING_OPTIONS[0][0]
+
+
+def _label_to_padding(label):
+    """显示文本 -> 补零位数"""
+    for text, value in NAME_PADDING_OPTIONS:
+        if text == label:
+            return str(value)
+    return str(DEFAULT_IMAGE_NAME_PADDING)
+
+
+# ===== 窗口尺寸三档选项 =====
+WINDOW_SIZES = {
+    'large': (1280, 860),
+    'medium': (960, 720),
+    'small': (780, 600),
+}
+
+# ===== 左侧边栏配色（深色主题，选中高亮蓝） =====
+SIDEBAR_BG = "#1e293b"               # 侧栏底色 (slate-800)
+SIDEBAR_HOVER_BG = "#334155"         # 导航悬停反馈 (slate-700)
+NAV_SELECTED_BG = "#2563eb"          # 导航选中高亮 (blue-600)
+NAV_SELECTED_HOVER_BG = "#3b82f6"    # 选中项悬停 (blue-500)
+NAV_TEXT = "#cbd5e1"                 # 未选中文字 (slate-300)
+NAV_SELECTED_TEXT = "#ffffff"        # 选中文字
+SIDEBAR_TITLE_TEXT = "#f8fafc"       # 标题文字 (slate-50)
+SIDEBAR_SEP_BG = "#475569"           # 分隔线 (slate-600)
 
 
 class GenericComicDownloaderGUI:
@@ -27,20 +93,58 @@ class GenericComicDownloaderGUI:
         self.login_window_open = False
         self.cookies_dir = self.load_config().get('cookies_dir', DEFAULT_COOKIES_DIR)
         
-        # 直接使用Frame，不使用Canvas滚动
-        self.main_frame = ttk.Frame(root, padding="10")
-        self.main_frame.pack(fill="both", expand=True)
-        
-        # ========== 标题 ==========
-        title_label = ttk.Label(
-            self.main_frame, 
-            text="通用漫画下载器", 
-            font=("微软雅黑", 16, "bold")
+        # 外层容器：左侧边栏 + 右侧内容区（不使用Canvas滚动）
+        self.root_container = ttk.Frame(root)
+        self.root_container.pack(fill="both", expand=True)
+
+        # ========== 左侧边栏导航（固定宽度，不可被内容挤压） ==========
+        self.sidebar = tk.Frame(self.root_container, bg=SIDEBAR_BG, width=100)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        self.sidebar.pack_propagate(False)
+
+        # 应用标题
+        tk.Label(
+            self.sidebar,
+            text="通用漫画\n下载器",
+            font=("微软雅黑", 12, "bold"),
+            bg=SIDEBAR_BG,
+            fg=SIDEBAR_TITLE_TEXT,
+            justify=tk.CENTER,
+        ).pack(fill=tk.X, pady=(18, 4))
+
+        # 标题与导航之间的分隔线
+        tk.Frame(self.sidebar, bg=SIDEBAR_SEP_BG, height=1).pack(fill=tk.X, padx=14, pady=6)
+
+        # 导航按钮：主页 / 设置（选中态高亮、悬停有反馈）
+        self.nav_main_btn = tk.Button(
+            self.sidebar, text="🏠 主页", font=("微软雅黑", 11),
+            bg=SIDEBAR_BG, fg=NAV_TEXT,
+            activebackground=SIDEBAR_HOVER_BG, activeforeground="#ffffff",
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+            anchor="w", padx=14, pady=9, cursor="hand2",
+            command=lambda: self.show_page('main')
         )
-        title_label.pack(pady=(0, 8))
+        self.nav_main_btn.pack(fill=tk.X, padx=6, pady=2)
+        self.nav_settings_btn = tk.Button(
+            self.sidebar, text="⚙ 设置", font=("微软雅黑", 11),
+            bg=SIDEBAR_BG, fg=NAV_TEXT,
+            activebackground=SIDEBAR_HOVER_BG, activeforeground="#ffffff",
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+            anchor="w", padx=14, pady=9, cursor="hand2",
+            command=lambda: self.show_page('settings')
+        )
+        self.nav_settings_btn.pack(fill=tk.X, padx=6, pady=2)
+
+        # ========== 右侧内容区 ==========
+        self.main_frame = ttk.Frame(self.root_container, padding="10")
+        self.main_frame.pack(side=tk.LEFT, fill="both", expand=True)
+
+        # ========== 主页面 ==========
+        self.page_main = ttk.Frame(self.main_frame)
+        self.page_main.pack(fill=tk.BOTH, expand=True)
 
         # ========== 站点选择 + 管理按钮 ==========
-        site_row = ttk.Frame(self.main_frame)
+        site_row = ttk.Frame(self.page_main)
         site_row.pack(fill=tk.X, pady=3)
 
         ttk.Label(site_row, text="站点:").pack(side=tk.LEFT, padx=(0, 4))
@@ -60,9 +164,9 @@ class GenericComicDownloaderGUI:
         )
         self.site_combo.pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(site_row, text="添加文件", command=self.add_site_file, width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Button(site_row, text="添加文件夹", command=self.add_site_folder, width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Button(site_row, text="删除站点", command=self.remove_current_site, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="添加文件", command=self.add_site_file, width=9).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="添加文件夹", command=self.add_site_folder, width=9).pack(side=tk.LEFT, padx=2)
+        ttk.Button(site_row, text="删除站点", command=self.remove_current_site, width=9).pack(side=tk.LEFT, padx=2)
         ttk.Button(site_row, text="刷新", command=self.refresh_site_list, width=6).pack(side=tk.LEFT, padx=2)
         ttk.Button(site_row, text="打开目录", command=self.open_sites_dir, width=8).pack(side=tk.LEFT, padx=2)
 
@@ -74,7 +178,7 @@ class GenericComicDownloaderGUI:
         self.site_count_label.pack(side=tk.RIGHT, padx=4)
 
         # ========== 当前站点网址显示 ==========
-        url_row = ttk.Frame(self.main_frame)
+        url_row = ttk.Frame(self.page_main)
         url_row.pack(fill=tk.X, pady=(0, 3))
         ttk.Label(url_row, text="网站地址:", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=(0, 4))
         self.site_url_label = ttk.Label(
@@ -87,12 +191,12 @@ class GenericComicDownloaderGUI:
         ttk.Button(url_row, text="复制", command=self.copy_site_url, width=5).pack(side=tk.LEFT, padx=(4, 0))
 
         # ========== 两栏布局 ==========
-        columns_frame = ttk.Frame(self.main_frame)
+        columns_frame = ttk.Frame(self.page_main)
         columns_frame.pack(fill=tk.X, pady=5)
 
         # 左栏 - 漫画设置
         left_col = ttk.LabelFrame(columns_frame, text="漫画设置", padding="8")
-        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        left_col.pack(fill=tk.BOTH, expand=True)
 
         # 漫画名称
         name_row = ttk.Frame(left_col)
@@ -113,7 +217,7 @@ class GenericComicDownloaderGUI:
         ttk.Entry(chapter_row, textvariable=self.chapter_end_var, width=6).pack(side=tk.LEFT, padx=2)
         ttk.Label(chapter_row, text="(0=末章)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
 
-        # 漫画ID (腾讯动漫)
+        # 漫画ID (腾讯动漫/快看)
         self.comic_id_frame = ttk.Frame(left_col)
         self.use_comic_id_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -173,58 +277,29 @@ class GenericComicDownloaderGUI:
         ttk.Entry(path_row, textvariable=self.download_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         ttk.Button(path_row, text="浏览", command=self.browse_path, width=6).pack(side=tk.LEFT, padx=2)
 
-        # 右栏 - 下载 & 浏览器设置
-        right_col = ttk.LabelFrame(columns_frame, text="下载设置", padding="8")
-        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
-
-        # 标签页数
-        thread_row = ttk.Frame(right_col)
-        thread_row.pack(fill=tk.X, pady=2)
-        ttk.Label(thread_row, text="标签页数:", width=9).pack(side=tk.LEFT)
+        # ========== 通用设置变量（控件位于"⚙ 设置"对话框，见 open_settings） ==========
         self.thread_var = tk.StringVar(value="5")
-        ttk.Entry(thread_row, textvariable=self.thread_var, width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Label(thread_row, text="(推荐5)", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
-
-        # 下载线程 + 模式
-        dl_row = ttk.Frame(right_col)
-        dl_row.pack(fill=tk.X, pady=2)
-        ttk.Label(dl_row, text="下载线程:", width=9).pack(side=tk.LEFT)
         self.download_thread_var = tk.StringVar(value="4")
-        ttk.Entry(dl_row, textvariable=self.download_thread_var, width=6).pack(side=tk.LEFT, padx=2)
         self.download_mode_var = tk.StringVar(value="coroutine")
-        ttk.Radiobutton(dl_row, text="协程", variable=self.download_mode_var, value="coroutine").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(dl_row, text="多线程", variable=self.download_mode_var, value="thread_only").pack(side=tk.LEFT, padx=4)
-
-        # 超时设置
-        timeout_row = ttk.Frame(right_col)
-        timeout_row.pack(fill=tk.X, pady=2)
-        ttk.Label(timeout_row, text="首次超时:", width=9).pack(side=tk.LEFT)
         self.first_timeout_var = tk.StringVar(value="8")
-        ttk.Entry(timeout_row, textvariable=self.first_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(timeout_row, text="秒").pack(side=tk.LEFT)
-        ttk.Label(timeout_row, text="重试:", width=5).pack(side=tk.LEFT, padx=(8, 0))
         self.retry_timeout_var = tk.StringVar(value="15")
-        ttk.Entry(timeout_row, textvariable=self.retry_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(timeout_row, text="秒").pack(side=tk.LEFT)
-
-        # 浏览器类型
-        browser_type_row = ttk.Frame(right_col)
-        browser_type_row.pack(fill=tk.X, pady=2)
-        ttk.Label(browser_type_row, text="浏览器:", width=9).pack(side=tk.LEFT)
         self.browser_type_var = tk.StringVar(value="edge")
-        ttk.Radiobutton(browser_type_row, text="Edge", variable=self.browser_type_var, value="edge", command=self.update_browser_path).pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(browser_type_row, text="Chrome", variable=self.browser_type_var, value="chrome", command=self.update_browser_path).pack(side=tk.LEFT, padx=4)
         self.browser_mode_var = tk.StringVar(value="headed")
-        ttk.Radiobutton(browser_type_row, text="有头", variable=self.browser_mode_var, value="headed").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(browser_type_row, text="无头", variable=self.browser_mode_var, value="headless").pack(side=tk.LEFT, padx=4)
-
-        # 浏览器路径
-        browser_path_row = ttk.Frame(right_col)
-        browser_path_row.pack(fill=tk.X, pady=2)
-        ttk.Label(browser_path_row, text="路径:", width=9).pack(side=tk.LEFT)
         self.browser_path_var = tk.StringVar(value=BROWSER_PATHS['edge'])
-        ttk.Entry(browser_path_row, textvariable=self.browser_path_var, font=("微软雅黑", 10)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(browser_path_row, text="浏览", command=self.browse_browser, width=6).pack(side=tk.LEFT, padx=2)
+        self.create_zip_var = tk.BooleanVar(value=False)
+        self.image_name_padding_var = tk.StringVar(value=str(DEFAULT_IMAGE_NAME_PADDING))
+        self.chapter_folder_naming_var = tk.StringVar(value=DEFAULT_CHAPTER_FOLDER_NAMING)
+        self.window_size_var = tk.StringVar(value="medium")
+        # 初始化完成前禁止自动保存（避免构建期间 on_site_change 等以默认值覆盖 config.json）
+        self._config_loaded = False
+
+        # 通用设置任一选项变化即自动保存（设置面板修改即时生效）
+        for _var in (self.thread_var, self.download_thread_var, self.download_mode_var,
+                     self.first_timeout_var, self.retry_timeout_var,
+                     self.browser_type_var, self.browser_mode_var, self.browser_path_var,
+                     self.create_zip_var, self.image_name_padding_var,
+                     self.chapter_folder_naming_var):
+            _var.trace_add('write', self._on_settings_changed)
 
         # ========== 站点切换逻辑 ==========
         def on_site_change(*args):
@@ -246,7 +321,7 @@ class GenericComicDownloaderGUI:
                 return
 
             # 漫画ID
-            if site_name == "腾讯动漫":
+            if site_name in ("腾讯动漫", "快看"):
                 self.comic_id_frame.pack(fill=tk.X, pady=2, after=self.comic_name_entry.master)
             else:
                 self.comic_id_frame.pack_forget()
@@ -283,8 +358,8 @@ class GenericComicDownloaderGUI:
         on_site_change()
 
         # ========== 按钮行 ==========
-        self.button_frame = ttk.Frame(self.main_frame)
-        self.button_frame.pack(fill=tk.X, pady=8)
+        self.button_frame = ttk.Frame(self.page_main)
+        self.button_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Button(self.button_frame, text="清空状态", command=self.clear_status).pack(side=tk.LEFT, padx=3)
         ttk.Button(self.button_frame, text="下载失败图片", command=self.download_failed_images).pack(side=tk.LEFT, padx=3)
@@ -298,7 +373,7 @@ class GenericComicDownloaderGUI:
         self.confirm_button.pack(side=tk.RIGHT, padx=3)
 
         # ========== 进度区域 ==========
-        self.url_progress_frame = ttk.LabelFrame(self.main_frame, text="获取图片URL进度", padding="8")
+        self.url_progress_frame = ttk.LabelFrame(self.page_main, text="获取图片URL进度", padding="8")
         self.url_progress_frame.pack(fill=tk.X, pady=3)
 
         url_info = ttk.Frame(self.url_progress_frame)
@@ -308,7 +383,7 @@ class GenericComicDownloaderGUI:
         self.url_progress_bar = ttk.Progressbar(self.url_progress_frame, orient=tk.HORIZONTAL, mode='determinate')
         self.url_progress_bar.pack(fill=tk.X, pady=3)
 
-        self.progress_frame = ttk.LabelFrame(self.main_frame, text="下载进度", padding="8")
+        self.progress_frame = ttk.LabelFrame(self.page_main, text="下载进度", padding="8")
         self.progress_frame.pack(fill=tk.X, pady=3)
 
         dl_info = ttk.Frame(self.progress_frame)
@@ -321,8 +396,8 @@ class GenericComicDownloaderGUI:
         self.progress_bar.pack(fill=tk.X, pady=3)
 
         # ========== 状态日志 ==========
-        self.status_frame = ttk.LabelFrame(self.main_frame, text="下载状态", padding="8")
-        self.status_frame.pack(fill=tk.X, pady=3)
+        self.status_frame = ttk.LabelFrame(self.page_main, text="下载状态", padding="8")
+        self.status_frame.pack(fill=tk.BOTH, expand=True, pady=3)
 
         self.status_text = tk.Text(
             self.status_frame,
@@ -331,28 +406,157 @@ class GenericComicDownloaderGUI:
             state=tk.DISABLED,
             height=12
         )
-        self.status_text.pack(fill=tk.X)
+        self.status_text.pack(fill=tk.BOTH, expand=True)
 
         status_scrollbar = ttk.Scrollbar(self.status_text, command=self.status_text.yview)
         status_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.status_text.config(yscrollcommand=status_scrollbar.set)
 
         self.style = ttk.Style()
+        # ===== 界面美化：统一字体、间距与主题色 =====
+        # 全局基础字体统一为微软雅黑（未单独指定字体的控件继承此设置）
+        self.style.configure(".", font=("微软雅黑", 10))
         self.style.configure(
             "Accent.TButton", 
-            foreground="black", 
-            background="black",
-            font=("微软雅黑", 10, "bold")
+            font=("微软雅黑", 10, "bold"),
+            padding=(12, 4)
         )
+        # 分组卡片统一内边距与标题字重
+        self.style.configure("Card.TLabelframe", padding="12")
+        self.style.configure("Card.TLabelframe.Label", font=("微软雅黑", 10, "bold"))
+
+        # ========== 设置页面 ==========
+        self.page_settings = ttk.Frame(self.main_frame)
+        self.page_settings.columnconfigure(0, weight=1)
+
+        # ---- 图片设置 ----
+        img_frame = ttk.LabelFrame(self.page_settings, text="图片设置", style="Card.TLabelframe")
+        img_frame.grid(row=0, column=0, sticky='ew', padx=12, pady=(12, 6))
+        img_frame.columnconfigure(1, weight=1)
+        ttk.Label(img_frame, text="图片命名:").grid(row=0, column=0, sticky='e', padx=(0, 10), pady=4)
+        self.padding_combo = ttk.Combobox(
+            img_frame,
+            values=[label for label, _ in NAME_PADDING_OPTIONS],
+            state="readonly",
+            width=28
+        )
+        self.padding_combo.set(_padding_to_label(self.image_name_padding_var.get()))
+        self.padding_combo.grid(row=0, column=1, sticky='w', pady=4)
+        self.padding_combo.bind('<<ComboboxSelected>>', self._on_padding_selected)
+        ttk.Label(img_frame, text="示例：001、002、003（下载的图片文件名）",
+                  font=("微软雅黑", 9), foreground="gray").grid(row=1, column=1, sticky='w')
+
+        ttk.Label(img_frame, text="章节文件夹命名:").grid(row=2, column=0, sticky='e', padx=(0, 10), pady=4)
+        self.chapter_naming_combo = ttk.Combobox(
+            img_frame,
+            values=[label for label, _ in CHAPTER_FOLDER_NAMING_OPTIONS],
+            state="readonly",
+            width=28
+        )
+        self.chapter_naming_combo.set(_chapter_naming_to_label(self.chapter_folder_naming_var.get()))
+        self.chapter_naming_combo.grid(row=2, column=1, sticky='w', pady=4)
+        self.chapter_naming_combo.bind('<<ComboboxSelected>>', self._on_chapter_naming_selected)
+        ttk.Label(img_frame, text="示例：1、2、3 或 1 第1话 xxx（漫画内章节文件夹名）",
+                  font=("微软雅黑", 9), foreground="gray").grid(row=3, column=1, sticky='w')
+
+        # ---- 窗口设置 ----
+        window_frame = ttk.LabelFrame(self.page_settings, text="窗口设置", style="Card.TLabelframe")
+        window_frame.grid(row=1, column=0, sticky='ew', padx=12, pady=6)
+        window_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(window_frame, text="窗口大小:").grid(row=0, column=0, sticky='e', padx=(0, 10), pady=4)
+        size_row = ttk.Frame(window_frame)
+        size_row.grid(row=0, column=1, sticky='w', pady=4)
+        ttk.Radiobutton(size_row, text="大（1280×860）", variable=self.window_size_var,
+                        value="large", command=self._on_window_size_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(size_row, text="中（960×720）", variable=self.window_size_var,
+                        value="medium", command=self._on_window_size_change).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Radiobutton(size_row, text="小（780×600）", variable=self.window_size_var,
+                        value="small", command=self._on_window_size_change).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(window_frame, text="切换后立即调整窗口大小并自动保存；窗口仍可手动拉伸",
+                  font=("微软雅黑", 9), foreground="gray").grid(row=1, column=1, sticky='w')
+
+        # ---- 下载设置 ----
+        dl_frame = ttk.LabelFrame(self.page_settings, text="下载设置", style="Card.TLabelframe")
+        dl_frame.grid(row=2, column=0, sticky='ew', padx=12, pady=6)
+        dl_frame.columnconfigure(0, weight=1)
+        dl_frame.columnconfigure(1, weight=1)
+        dl_left = ttk.Frame(dl_frame)
+        dl_left.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        dl_right = ttk.Frame(dl_frame)
+        dl_right.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
+        for sub in (dl_left, dl_right):
+            sub.columnconfigure(1, weight=1)
+
+        # 左半：标签页数 / 首次超时 / 下载模式（提示文字紧贴输入框）
+        ttk.Label(dl_left, text="标签页数:").grid(row=0, column=0, sticky='e', padx=(0, 8), pady=4)
+        tabs_row = ttk.Frame(dl_left)
+        tabs_row.grid(row=0, column=1, sticky='w', pady=4)
+        ttk.Spinbox(tabs_row, from_=1, to=20, textvariable=self.thread_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(tabs_row, text="(推荐5)", font=("微软雅黑", 9), foreground="gray").pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(dl_left, text="首次超时:").grid(row=1, column=0, sticky='e', padx=(0, 8), pady=4)
+        timeout_row = ttk.Frame(dl_left)
+        timeout_row.grid(row=1, column=1, sticky='w', pady=4)
+        ttk.Spinbox(timeout_row, from_=1, to=120, textvariable=self.first_timeout_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(timeout_row, text="秒", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(dl_left, text="下载模式:").grid(row=2, column=0, sticky='e', padx=(0, 8), pady=4)
+        mode_row = ttk.Frame(dl_left)
+        mode_row.grid(row=2, column=1, sticky='w', pady=4)
+        ttk.Radiobutton(mode_row, text="协程", variable=self.download_mode_var, value="coroutine").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="多线程", variable=self.download_mode_var, value="thread_only").pack(side=tk.LEFT, padx=(12, 0))
+
+        # 右半：下载线程 / 重试超时 / 压缩包
+        ttk.Label(dl_right, text="下载线程:").grid(row=0, column=0, sticky='e', padx=(0, 8), pady=4)
+        ttk.Spinbox(dl_right, from_=1, to=32, textvariable=self.download_thread_var, width=7).grid(row=0, column=1, sticky='w', pady=4)
+
+        ttk.Label(dl_right, text="重试超时:").grid(row=1, column=0, sticky='e', padx=(0, 8), pady=4)
+        retry_row = ttk.Frame(dl_right)
+        retry_row.grid(row=1, column=1, sticky='w', pady=4)
+        ttk.Spinbox(retry_row, from_=1, to=300, textvariable=self.retry_timeout_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(retry_row, text="秒", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(dl_right, text="压缩包:").grid(row=2, column=0, sticky='e', padx=(0, 6), pady=4)
+        ttk.Checkbutton(
+            dl_right, text="下载完成后生成",
+            variable=self.create_zip_var, command=self.on_create_zip_change
+        ).grid(row=2, column=1, columnspan=2, sticky='w', pady=4)
+
+        # ---- 浏览器设置 ----
+        browser_frame = ttk.LabelFrame(self.page_settings, text="浏览器设置", style="Card.TLabelframe")
+        browser_frame.grid(row=3, column=0, sticky='ew', padx=12, pady=(6, 12))
+        browser_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(browser_frame, text="类型:").grid(row=0, column=0, sticky='e', padx=(0, 10), pady=4)
+        type_row = ttk.Frame(browser_frame)
+        type_row.grid(row=0, column=1, sticky='w', pady=4)
+        ttk.Radiobutton(type_row, text="Edge", variable=self.browser_type_var, value="edge", command=self.update_browser_path).pack(side=tk.LEFT)
+        ttk.Radiobutton(type_row, text="Chrome", variable=self.browser_type_var, value="chrome", command=self.update_browser_path).pack(side=tk.LEFT, padx=(16, 0))
+
+        ttk.Label(browser_frame, text="模式:").grid(row=1, column=0, sticky='e', padx=(0, 10), pady=4)
+        mode_row2 = ttk.Frame(browser_frame)
+        mode_row2.grid(row=1, column=1, sticky='w', pady=4)
+        ttk.Radiobutton(mode_row2, text="有头（显示窗口）", variable=self.browser_mode_var, value="headed").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row2, text="无头（后台运行）", variable=self.browser_mode_var, value="headless").pack(side=tk.LEFT, padx=(16, 0))
+
+        ttk.Label(browser_frame, text="路径:").grid(row=2, column=0, sticky='e', padx=(0, 10), pady=4)
+        path_row = ttk.Frame(browser_frame)
+        path_row.grid(row=2, column=1, sticky='ew', pady=4)
+        path_row.columnconfigure(0, weight=1)
+        ttk.Entry(path_row, textvariable=self.browser_path_var, font=("微软雅黑", 9)).grid(row=0, column=0, sticky='ew', padx=(0, 6))
+        ttk.Button(path_row, text="浏览", command=self.browse_browser, width=6).grid(row=0, column=1)
 
         # 恢复上次保存的下载设置
         self.apply_saved_config()
+        # 初始显示主页面
+        self.show_page('main')
     
     def load_config(self):
-        """加载配置文件"""
+        """加载配置文件（utf-8-sig 兼容带 BOM 的文件）"""
         try:
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
                     return json.load(f)
         except Exception as e:
             print(f"加载配置文件失败: {e}")
@@ -372,6 +576,10 @@ class GenericComicDownloaderGUI:
                 'browser_type': self.browser_type_var.get(),
                 'browser_mode': self.browser_mode_var.get(),
                 'browser_path': self.browser_path_var.get().strip(),
+                'create_zip': self.create_zip_var.get(),
+                'image_name_padding': self.image_name_padding_var.get(),
+                'chapter_folder_naming': self.chapter_folder_naming_var.get(),
+                'window_size': self.window_size_var.get(),
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -383,6 +591,7 @@ class GenericComicDownloaderGUI:
         """启动时恢复上次保存的设置"""
         config = self.load_config()
         if not config:
+            self._config_loaded = True
             return
         mapping = {
             'download_path': self.download_path_var,
@@ -401,15 +610,30 @@ class GenericComicDownloaderGUI:
             self.browser_type_var.set(config['browser_type'])
         if config.get('browser_mode') in ('headed', 'headless'):
             self.browser_mode_var.set(config['browser_mode'])
+        if 'create_zip' in config:
+            self.create_zip_var.set(bool(config['create_zip']))
+        if 'image_name_padding' in config:
+            padding = config['image_name_padding']
+            if str(padding) in [str(v) for _, v in NAME_PADDING_OPTIONS]:
+                self.image_name_padding_var.set(str(padding))
+        if 'chapter_folder_naming' in config:
+            mode = config['chapter_folder_naming']
+            if str(mode) in [str(v) for _, v in CHAPTER_FOLDER_NAMING_OPTIONS]:
+                self.chapter_folder_naming_var.set(str(mode))
+        # 窗口大小（仅接受三档合法值，非法/缺失则保持默认"中"）
+        if config.get('window_size') in WINDOW_SIZES:
+            self.window_size_var.set(config['window_size'])
+            w, h = WINDOW_SIZES[config['window_size']]
+            self.root.geometry(f"{w}x{h}")
+        # 配置恢复完成，此后设置变更才自动保存
+        self._config_loaded = True
     
     def update_login_status(self):
         """更新登录状态显示"""
         site_name = self.site_var.get()
         # 使用动态获取的需要登录网站列表
         if site_name in self.sites_requiring_login:
-            temp_crawler = ComicCrawler.__new__(ComicCrawler)
-            temp_crawler.site_name = site_name
-            temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+            temp_crawler = self._make_temp_crawler()
             if temp_crawler.has_saved_cookies() or temp_crawler.has_cookie_str():
                 self.login_status_label.config(text="[已保存登录信息]", foreground="green")
             else:
@@ -421,6 +645,13 @@ class GenericComicDownloaderGUI:
         temp_crawler = ComicCrawler.__new__(ComicCrawler)
         temp_crawler.site_name = site_name
         temp_crawler.cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+        # 补齐 __init__ 才会设置的属性（has_saved_cookies 等依赖 needs_browser 判断）
+        try:
+            from site_discovery import get_site_crawler_class
+            site_cls = get_site_crawler_class(site_name)
+            temp_crawler.needs_browser = bool(getattr(site_cls, 'NEEDS_BROWSER', True))
+        except Exception:
+            temp_crawler.needs_browser = True
         return temp_crawler
 
     def _sync_cookie_str_display(self, site_name=None):
@@ -457,6 +688,62 @@ class GenericComicDownloaderGUI:
         except Exception as e:
             self.append_status(f"清除Cookie失败: {e}")
     
+    def _padding_display(self, padding):
+        """补零位数 -> 状态日志显示文本"""
+        if padding == 0:
+            return "原样（1、2、3...）"
+        return f"{padding}位补零（{'0' * (padding - 1)}1、{'0' * (padding - 1)}2...）"
+
+    def on_create_zip_change(self):
+        """压缩包选项改变时的回调"""
+        if self.create_zip_var.get():
+            self.append_status("已开启：下载完成后生成压缩包")
+        else:
+            self.append_status("已关闭：下载完成后不生成压缩包")
+
+    def show_page(self, page_name):
+        """左侧边栏页面切换：'main' 主页面 / 'settings' 设置页面"""
+        if page_name == 'main':
+            self.page_settings.pack_forget()
+            self.page_main.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.page_main.pack_forget()
+            self.page_settings.pack(fill=tk.BOTH, expand=True)
+        self._update_nav_highlight(page_name)
+
+    def _update_nav_highlight(self, page_name):
+        """更新侧边栏导航按钮的选中高亮（选中蓝底白字，未选中与侧栏底色融合）"""
+        for btn, name in ((self.nav_main_btn, 'main'), (self.nav_settings_btn, 'settings')):
+            if name == page_name:
+                btn.config(bg=NAV_SELECTED_BG, fg=NAV_SELECTED_TEXT,
+                           activebackground=NAV_SELECTED_HOVER_BG)
+            else:
+                btn.config(bg=SIDEBAR_BG, fg=NAV_TEXT,
+                           activebackground=SIDEBAR_HOVER_BG)
+
+    def _on_window_size_change(self):
+        """窗口尺寸变化：立即调整窗口大小并保存配置"""
+        w, h = WINDOW_SIZES.get(self.window_size_var.get(), WINDOW_SIZES['medium'])
+        self.root.geometry(f"{w}x{h}")
+        self.save_config()
+
+    def _on_settings_changed(self, *args):
+        """通用设置任一选项变化时自动保存到config.json（初始化完成前不保存）"""
+        if not self._config_loaded:
+            return
+        try:
+            self.save_config()
+        except Exception as e:
+            print(f"保存设置失败: {e}")
+
+    def _on_padding_selected(self, event=None):
+        """图片命名下拉选择：文本选项 -> 补零位数并保存"""
+        self.image_name_padding_var.set(_label_to_padding(self.padding_combo.get()))
+
+    def _on_chapter_naming_selected(self, event=None):
+        """章节文件夹命名下拉选择：文本选项 -> 模式值并保存"""
+        self.chapter_folder_naming_var.set(_label_to_chapter_naming(self.chapter_naming_combo.get()))
+
     def on_comic_id_check_change(self):
         """漫画ID选项改变时的回调"""
         if self.use_comic_id_var.get():
@@ -631,7 +918,7 @@ class GenericComicDownloaderGUI:
                 messagebox.showerror("错误", "请选择有效的站点")
                 return
             
-            use_comic_id = site_name == "腾讯动漫" and self.use_comic_id_var.get()
+            use_comic_id = site_name in ("腾讯动漫", "快看") and self.use_comic_id_var.get()
             comic_id = self.comic_id_var.get().strip() if use_comic_id else None
             
             comic_name = self.comic_name_var.get().strip()
@@ -695,6 +982,15 @@ class GenericComicDownloaderGUI:
                 self.append_status(f"同时打开标签页数: {max_threads}")
                 self.append_status(f"下载模式: {'纯多线程' if use_thread_only else '协程'}，线程数: {download_thread_count}")
                 self.append_status(f"首次超时: {first_timeout}秒, 重试超时: {retry_timeout}秒")
+                image_padding = int(self.image_name_padding_var.get().strip() or DEFAULT_IMAGE_NAME_PADDING)
+                self.append_status(f"图片命名: {self._padding_display(image_padding)}")
+                chapter_folder_naming = self.chapter_folder_naming_var.get()
+                self.append_status(f"章节文件夹命名: {_chapter_naming_to_label(chapter_folder_naming)}")
+                create_zip = self.create_zip_var.get()
+                if create_zip:
+                    self.append_status("压缩包选项: 已开启（下载完成后生成zip）")
+                else:
+                    self.append_status("压缩包选项: 未开启（下载完成后不生成zip）")
             
                 def pre_collect(actual_count):
                     self.reset_url_progress(actual_count)
@@ -720,6 +1016,9 @@ class GenericComicDownloaderGUI:
                     url_progress_callback=self.update_url_progress,
                     pre_download_hook=pre_download,
                     pre_collect_hook=pre_collect,
+                    create_zip=create_zip,
+                    image_name_padding=image_padding,
+                    chapter_folder_naming=chapter_folder_naming,
                 )
             
                 comic_name = result['comic_name']
@@ -739,11 +1038,18 @@ class GenericComicDownloaderGUI:
                     messagebox.showwarning("完成", f"漫画《{comic_name}》下载完成！\n\n注意：有 {len(failed_downloads)} 张图片最终下载失败。\n失败列表已保存到:\n{result['failed_json_path']}\n\n请使用'下载失败图片'功能重新下载。")
                 else:
                     self.append_status(f"✓ 漫画《{comic_name}》下载完成！")
+                    if create_zip:
+                        self.append_status(f"已生成压缩包: {os.path.join(download_path if download_path else '.', comic_name + '.zip')}")
+                    else:
+                        self.append_status("未生成压缩包（如需生成请勾选'下载完成后生成压缩包'）")
                     messagebox.showinfo("成功", f"漫画《{comic_name}》下载完成！")
                             
             finally:
-                crawler.page.close()
-                self.append_status("浏览器已关闭")
+                if crawler.page:
+                    crawler.page.close()
+                    self.append_status("浏览器已关闭")
+                else:
+                    self.append_status("该站点无需浏览器（纯HTTP下载）")
                 
         except Exception as e:
             self.append_status(f"下载过程中出错: {e}")
@@ -789,6 +1095,9 @@ class GenericComicDownloaderGUI:
                     browser_path = self.browser_path_var.get().strip()
                     headless = self.browser_mode_var.get() == "headless"
                     cookies_dir = self.cookies_path_var.get().strip() or DEFAULT_COOKIES_DIR
+                    # 浏览器重试会重新生成文件名，需恢复命名规则
+                    from downloader import set_active_name_padding
+                    set_active_name_padding(int(self.image_name_padding_var.get().strip() or 0))
                     self.append_status(f"浏览器渲染模式({data.get('render_mode')})：重跑失败章节的浏览器提取，站点: {retry_site}")
                     from downloader import retry_failed_chapters_via_browser
                     still_failed, all_success = retry_failed_chapters_via_browser(
@@ -998,6 +1307,8 @@ class GenericComicDownloaderGUI:
 def main():
     root = tk.Tk()
     app = GenericComicDownloaderGUI(root)
+    # 代理检测移至后台：窗口先显示（避免阻塞启动），检测完成后再显示结果日志
+    threading.Thread(target=get_active_proxy, daemon=True).start()
     root.mainloop()
 
 

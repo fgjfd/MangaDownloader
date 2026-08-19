@@ -47,8 +47,42 @@ class BaoziCrawler:
         target_comic_tab = self.crawler.page.new_tab(href)
         return target_comic_tab
 
+    def _collect_chapter_entries(self, target_comic_tab):
+        """从详情页完整章节列表提取章节条目，按章节号升序返回 [{url, title}]
+
+        包子漫画详情页章节列表（a.comics-chapters__item）为静态渲染（无头模式同样
+        可用），但列表含重复项（首尾各有最新几章），需按 (section_slot, chapter_slot)
+        去重，章节名（"第1186话 再一次"）与章节号正确对应。
+        """
+        try:
+            items = target_comic_tab.eles(
+                'xpath://a[contains(@class, "comics-chapters__item")]', timeout=10)
+            by_key = {}
+            for item in items:
+                href = item.attr('href') or ''
+                m = re.search(r'section_slot=(\d+).*?chapter_slot=(\d+)', href)
+                if not m:
+                    continue
+                key = (int(m.group(1)), int(m.group(2)))
+                title = ' '.join((item.text or '').split())
+                if key not in by_key:
+                    by_key[key] = {'url': href, 'title': title}
+            entries = [by_key[k] for k in sorted(by_key)]
+            print(f"章节列表: {len(entries)} 个唯一章节（含章节名）")
+            return entries
+        except Exception as e:
+            print(f"获取章节列表失败: {e}")
+            return []
+
     def get_chapter_count(self, target_comic_tab):
-        """从章节URL中提取最大章节号"""
+        """获取章节总数：优先用完整章节列表（去重），失败回退模板URL提取最大章节号"""
+        # 尝试完整章节列表（含真实章节名）
+        entries = self._collect_chapter_entries(target_comic_tab)
+        if entries:
+            self._chapter_entries = entries
+            return len(entries)
+        self._chapter_entries = []
+        # 回退：从"最新章节"链接提取最大章节号（章节名不可用，collect阶段回退"第N章"）
         try:
             chapter_ele = target_comic_tab.ele(self.locators['chapter_link_template'], timeout=5)
             href = chapter_ele.attr('href')
@@ -68,6 +102,15 @@ class BaoziCrawler:
             print(f"获取章节数失败: {e}")
 
         return 0
+
+    def _get_chapter_title(self, num):
+        """按章节号取章节名（回退逻辑：模板模式无真实标题时用"第N章"）"""
+        entries = getattr(self, '_chapter_entries', None) or []
+        if num - 1 < len(entries):
+            title = entries[num - 1].get('title', '')
+            if title:
+                return title
+        return f"第{num}章"
 
     def _click_continue_view(self, chapter_tab):
         """检查是否有'继续查看'按钮，有则点击并等待"""
@@ -191,6 +234,7 @@ class BaoziCrawler:
                         chapter_tab.close()
                         return {
                             'chapter_num': chapter_num,
+                            'title': chapter_info.get('title', ''),
                             'herf_list': []
                         }
                 else:
@@ -206,6 +250,7 @@ class BaoziCrawler:
 
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
 
@@ -228,12 +273,15 @@ class BaoziCrawler:
 
         print(f"将下载第 {actual_start}-{actual_end} 章，共 {actual_end - actual_start + 1} 章")
 
-        # 生成章节URL列表（通过替换URL中的章节号）
-        chapter_urls = []
-        for num in range(1, all_chapters_num + 1):
-            # 将模板URL中的chapter_slot参数替换为目标章节号
-            chapter_url = re.sub(r'chapter_slot=\d+', f'chapter_slot={num}', self.chapter_url_template)
-            chapter_urls.append(chapter_url)
+        # 生成章节列表：优先用完整章节列表（真实URL+章节名），回退模板URL替换
+        entries = getattr(self, '_chapter_entries', None) or []
+        if not entries:
+            entries = self._collect_chapter_entries(target_comic_tab)
+            self._chapter_entries = entries
+        if not entries and getattr(self, 'chapter_url_template', None):
+            entries = [{'url': re.sub(r'chapter_slot=\d+', f'chapter_slot={num}',
+                                      self.chapter_url_template),
+                        'title': f"第{num}章"} for num in range(1, all_chapters_num + 1)]
 
         all_chapters_data = []
         current_chapter = actual_start
@@ -244,11 +292,16 @@ class BaoziCrawler:
 
             batch_chapters_info = []
             for num in range(current_chapter, group_end + 1):
-                chapter_url = chapter_urls[num - 1]  # 索引从0开始
+                entry = entries[num - 1] if num - 1 < len(entries) else {}
+                chapter_url = entry.get('url') or (
+                    re.sub(r'chapter_slot=\d+', f'chapter_slot={num}',
+                           getattr(self, 'chapter_url_template', '')) if getattr(self, 'chapter_url_template', '') else '')
+                title = entry.get('title') or self._get_chapter_title(num)
 
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': title,
                     'main_tab': self.crawler.tab
                 })
                 print(f"准备处理第{num}章节: {chapter_url}")

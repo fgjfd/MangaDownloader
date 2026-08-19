@@ -3,9 +3,10 @@ from utils import ensure_console_safe
 ensure_console_safe()  # 入口加固：防GBK打印崩溃，须在其他导入前执行
 
 import os
+import json
 from crawler import ComicCrawler
 from download_flow import run_download_flow
-from config import DEFAULT_SITE, BROWSER_PATHS
+from config import DEFAULT_SITE, BROWSER_PATHS, DEFAULT_IMAGE_NAME_PADDING, DEFAULT_CHAPTER_FOLDER_NAMING
 from site_discovery import get_all_site_names
 
 
@@ -66,10 +67,23 @@ def main():
     print("\n正在启动浏览器...")
     crawler = ComicCrawler(site_name, browser_path, headless)
     
+    # 图片命名规则/章节文件夹命名：优先读取GUI保存的config.json，缺省使用默认值
+    image_name_padding = DEFAULT_IMAGE_NAME_PADDING
+    chapter_folder_naming = DEFAULT_CHAPTER_FOLDER_NAMING
+    try:
+        with open('config.json', encoding='utf-8') as f:
+            saved_cfg = json.load(f)
+        image_name_padding = int(saved_cfg.get('image_name_padding', DEFAULT_IMAGE_NAME_PADDING))
+        chapter_folder_naming = saved_cfg.get('chapter_folder_naming', DEFAULT_CHAPTER_FOLDER_NAMING)
+    except Exception:
+        pass
+    
     try:
         result = run_download_flow(
             crawler, comic_name, chapter_end=comic_num,
-            download_path=download_path, log=print
+            download_path=download_path, log=print,
+            image_name_padding=image_name_padding,
+            chapter_folder_naming=chapter_folder_naming
         )
 
         failed_downloads = result['failed_downloads']

@@ -9,6 +9,7 @@
 - ✅ **多站点支持**：已适配多个漫画站点
 - ✅ **章节选择**：支持下载指定范围的章节
 - ✅ **并行下载**：多线程加速图片下载
+- ✅ **章节文件夹命名**：支持数字（1、2、3...）或章节名（1 第1话 xxx）两种模式
 - ✅ **进度显示**：实时显示下载进度和网速
 - ✅ **失败重试**：自动重试失败的图片，保存失败列表
 - ✅ **站点管理**：支持添加/删除站点，自动检测重复
@@ -59,6 +60,15 @@ python gui.py
 4. **浏览器设置**：选择浏览器类型和模式（有头/无头）
 5. **下载设置**：设置标签页数、下载线程数等参数
 6. **开始下载**：点击"开始下载"按钮
+
+#### 章节文件夹命名
+
+在设置页面的"图片设置"区域，可切换章节文件夹命名方式：
+
+- **数字（1、2、3...）**：保持原有命名，章节文件夹为 `1`、`2`、`3`
+- **章节名（1 第1话 xxx）**：使用漫画站点的真实章节名，如 `1 第1话 初次相遇`
+
+> 章节名来自站点章节列表的真实标题；若某章节无法获取到标题（如懒加载未渲染），自动回退为数字命名。非法字符（`\ / : * ? " < > |`）会被自动替换，避免 Windows 文件系统错误。
 
 #### 站点管理
 
@@ -152,7 +162,7 @@ class NewsiteCrawler:
     def collect_chapters_images(self, target_comic_tab, chapter_start=1, chapter_end=0, max_threads=5, progress_callback=None):
         """收集章节图片URL"""
         # 实现章节图片收集逻辑
-        # 详见：新站点爬虫开发Skill.md
+        # 详见：.opencode/skills/comic-site-crawler/SKILL.md
         pass
 ```
 
@@ -170,7 +180,7 @@ class NewsiteCrawler:
    - `get_cover_image()` - 封面图片属性不同时
    - `get_chapter_image_urls()` - 图片提取逻辑
 
-详细开发指南请参考：[新站点爬虫开发Skill.md](新站点爬虫开发Skill.md)
+详细开发指南请参考：`.opencode/skills/comic-site-crawler/`（新站点爬虫开发 Skill，含 SKILL.md 工作流、Crawler 规范、常见坑、特殊站点策略与代码模板）
 
 ## 项目结构
 
@@ -260,7 +270,7 @@ A: 部分站点CDN需要代理，可在爬虫CONFIG中配置proxy参数。
 
 **Q: 如何添加新站点？**
 
-A: 参考 `新站点爬虫开发Skill.md` 文档开发爬虫文件，放入 `sites_data/` 目录即可。
+A: 参考 `.opencode/skills/comic-site-crawler/SKILL.md` 开发爬虫文件，放入 `sites_data/` 目录即可。
 
 ## 技术栈
 

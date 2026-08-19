@@ -208,7 +208,8 @@ class TencentCrawler:
                         href = 'https://ac.qq.com' + href
                     chapter_urls.append({
                         'num': idx,
-                        'url': href
+                        'url': href,
+                        'title': ' '.join(''.join(a_ele.itertext()).split()),
                     })
             
             print(f"\n========== 章节列表获取完成 ==========")
@@ -323,6 +324,7 @@ class TencentCrawler:
                         chapter_tab.close()
                         return {
                             'chapter_num': chapter_num,
+                            'title': chapter_info.get('title', ''),
                             'herf_list': []
                         }
                 else:
@@ -341,6 +343,7 @@ class TencentCrawler:
         
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
     
@@ -378,6 +381,7 @@ class TencentCrawler:
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': chapter_urls[num - 1].get('title', ''),
                     'main_tab': self.crawler.tab
                 })
                 

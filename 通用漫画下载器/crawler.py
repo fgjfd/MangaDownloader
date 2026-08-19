@@ -24,16 +24,55 @@ class ComicCrawler:
         self.login_completed = False
         self.cookies_dir = cookies_dir if cookies_dir else DEFAULT_COOKIES_DIR
 
+        # 站点是否需要浏览器：纯requests实现的站点（如喜漫漫画）声明NEEDS_BROWSER=False，
+        # 跳过浏览器启动（浏览器打开慢、且favcomic等站点代理出口被WAF拦截需直连）
+        self.needs_browser = bool(getattr(self.site_crawler_class, 'NEEDS_BROWSER', True))
+
         # 未显式提供cookie_str时，尝试加载用户保存的Cookie字符串
         if not self.cookie_str:
             self.cookie_str = self.load_cookie_str()
 
+        if not self.needs_browser:
+            self.page = None
+            self.tab = None
+            print(f"站点 {site_name} 无需浏览器（纯HTTP实现），跳过浏览器启动")
+            self.site_crawler = self.site_crawler_class(self)
+            if self.cookie_str:
+                self.set_cookie()
+            return
+
         print(f"正在初始化浏览器...")
-        co = ChromiumOptions().set_paths(browser_path)
+        co = ChromiumOptions()
+        co.set_browser_path(browser_path)
         
-        import random
-        debug_port = random.randint(9223, 9322)
-        co.set_argument(f"--remote-debugging-port={debug_port}")
+        # 查找可用端口并直接设置地址，避免端口冲突导致浏览器无法启动或不显示窗口
+        import socket
+        debug_port = None
+        for port in range(9223, 9323):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('127.0.0.1', port))
+                    debug_port = port
+                    break
+            except OSError:
+                continue
+        if debug_port is None:
+            import random
+            debug_port = random.randint(9223, 9322)
+        co.set_local_port(debug_port)
+        print(f"使用调试端口: {debug_port}")
+        
+        # 每次启动使用独立的用户数据临时目录，避免复用残留目录导致浏览器进程连接异常
+        import tempfile
+        user_data_path = tempfile.mkdtemp(prefix='comic_dl_')
+        co.set_user_data_path(user_data_path)
+        
+        # 禁用窗口遮挡检测与后台节流：窗口被遮挡/最小化时Chrome会把rAF节流到~1fps，
+        # 依赖rAF的阅读器（如B漫）翻页动画/图片解密会卡死在第1页
+        co.set_argument("--disable-backgrounding-occluded-windows")
+        co.set_argument("--disable-renderer-backgrounding")
+        co.set_argument("--disable-background-timer-throttling")
+        co.set_argument("--disable-features=CalculateNativeWinOcclusion")
         
         if headless:
             co.headless()
@@ -48,6 +87,12 @@ class ComicCrawler:
             print("已启用无头模式")
         else:
             print("已启用有头模式")
+
+        # 直连模式：站点CONFIG声明direct_connect时禁用系统代理（浏览器直连）
+        # 适用于代理出口IP被站点WAF拉黑（直连200/代理403）的站点，如喜漫漫画
+        if self.site_config.get('direct_connect'):
+            co.set_argument('--no-proxy-server')
+            print("该站点启用直连模式（禁用系统代理，浏览器直连访问）")
         
         try:
             self.page = ChromiumPage(co)
@@ -140,6 +185,9 @@ class ComicCrawler:
         return os.path.join(self.cookies_dir, f"{self.site_name}_cookies.json")
     
     def save_cookies(self):
+        if not self.needs_browser:
+            print("该站点无需浏览器（纯HTTP），不保存浏览器Cookie")
+            return False
         try:
             cookies = self.tab.cookies()
             cookies_path = self.get_cookies_path()
@@ -152,6 +200,8 @@ class ComicCrawler:
             return False
     
     def load_cookies(self):
+        if not self.needs_browser:
+            return False
         try:
             cookies_path = self.get_cookies_path()
             if not os.path.exists(cookies_path):
@@ -169,10 +219,15 @@ class ComicCrawler:
             return False
     
     def has_saved_cookies(self):
+        if not self.needs_browser:
+            return False
         cookies_path = self.get_cookies_path()
         return os.path.exists(cookies_path)
     
     def open_login_page(self):
+        if not self.needs_browser:
+            print(f"{self.site_name} 无需浏览器登录，请使用Cookie字符串输入")
+            return False
         print(f"正在打开 {self.site_name} 登录页面...")
         self.tab.get(self.site_config['site_url'])
         print(f"请在浏览器中完成登录操作")
@@ -217,7 +272,10 @@ class ComicCrawler:
     def set_cookie(self):
         if not self.cookie_str:
             return False
-        
+        if not self.needs_browser:
+            # 纯requests站点：cookie_str 由站点爬虫的请求头直接携带
+            print("该站点无需浏览器，Cookie将由爬虫请求头直接携带")
+            return True
         try:
             from urllib.parse import urlparse
             

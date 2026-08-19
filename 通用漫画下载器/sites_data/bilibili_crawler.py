@@ -16,11 +16,15 @@ class BilibiliCrawler:
     # 站点元数据
     SITE_NAME = '哔哩哔哩漫画'
     SITE_URL = 'https://manga.bilibili.com/'
-    REQUIRES_LOGIN = False
-    # 登录非必需，但支持Cookie输入（登录态可解锁已购章节）
+    # 实测B漫必须登录（Cookie）才能正常浏览/阅读，否则章节列表与阅读页均不可用
+    REQUIRES_LOGIN = True
+    # 支持Cookie输入（登录态解锁已购章节）
     SUPPORTS_COOKIE_INPUT = True
+    # 章节数直接取自详情页Vue完整章节数据，天然稳定，跳过download_flow的重复校验
+    STABLE_CHAPTER_COUNT = True
 
     # 页面加载前注入的钩子：捕获所有createObjectURL产生的blob（解密后的明文图片）
+    # at字段记录捕获时间，供提取时按时间排序（双缓冲预加载可能打乱捕获顺序）
     BLOB_HOOK_JS = """
     window.__captured_blobs = window.__captured_blobs || [];
     if (!window.__blob_hook_installed) {
@@ -29,7 +33,7 @@ class BilibiliCrawler:
         URL.createObjectURL = function(obj) {
             var url = __orig_cob(obj);
             if (url.indexOf('blob:') === 0) {
-                window.__captured_blobs.push({url: url, size: obj.size || 0, type: obj.type || ''});
+                window.__captured_blobs.push({url: url, size: obj.size || 0, type: obj.type || '', at: Date.now()});
             }
             return url;
         };
@@ -48,26 +52,57 @@ class BilibiliCrawler:
     return texts.length ? texts[0] : [0, 0];
     """
 
-    # 翻页JS：阅读器监听完整鼠标事件序列（pointerdown/mousedown/.../click），
-    # 仅el.click()在双页跨页模式(double-page)下不响应，必须带坐标派发完整序列
+    # 翻页JS：B漫阅读器有两种布局，需按容器可滚性分流——
+    # 1) 长条滚动阅读器（隐山梦谈等）：全部页面canvas竖排于.ps-container，
+    #    scrollHeight>>clientHeight，滚动容器即翻页；
+    # 2) 跨页canvas阅读器（鬼灭之刃等）：无滚动容器，仅当前跨页canvas存在，
+    #    实测点击画布右90%区域为唯一稳定翻页方式（scroll/keyboard/箭头合成事件均被过滤）。
     NEXT_PAGE_JS = """
+    var c = document.querySelector('.ps-container');
+    if (c && c.scrollHeight > c.clientHeight + 50) {
+        c.scrollTop += Math.max(600, c.clientHeight);
+        return;
+    }
+    var cv = document.querySelector('canvas');
+    if (cv) {
+        var r = cv.getBoundingClientRect();
+        var x = r.x + r.width * 0.9, y = r.y + r.height * 0.5;
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+            cv.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
+        });
+        return;
+    }
     var el = document.querySelector('.arrow-right');
     if (el) {
-        var r = el.getBoundingClientRect();
-        var x = r.x + r.width * 0.75, y = r.y + r.height * 0.5;
+        var r2 = el.getBoundingClientRect();
+        var x2 = r2.x + r2.width * 0.75, y2 = r2.y + r2.height * 0.5;
         ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
-            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
+            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x2, clientY:y2}));
         });
     }
     """
 
     PREV_PAGE_JS = """
+    var c = document.querySelector('.ps-container');
+    if (c && c.scrollHeight > c.clientHeight + 50) {
+        c.scrollTop = 0;
+        return;
+    }
+    var cv = document.querySelector('canvas');
+    if (cv) {
+        var r = cv.getBoundingClientRect();
+        var x = r.x + r.width * 0.08, y = r.y + r.height * 0.5;
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+            cv.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
+        });
+        return;
+    }
     var el = document.querySelector('.pageup') || document.querySelector('.arrow-left');
     if (el) {
-        var r = el.getBoundingClientRect();
-        var x = r.x + r.width * 0.25, y = r.y + r.height * 0.5;
+        var r2 = el.getBoundingClientRect();
+        var x2 = r2.x + r2.width * 0.25, y2 = r2.y + r2.height * 0.5;
         ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
-            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
+            el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window, clientX:x2, clientY:y2}));
         });
     }
     """
@@ -112,13 +147,15 @@ class BilibiliCrawler:
             'prev_page_js': PREV_PAGE_JS,
             # 向前翻页
             'next_page_js': NEXT_PAGE_JS,
-            # 停滞兜底也用完整鼠标事件序列（该阅读器不响应键盘事件）
+            # 停滞兜底同样优先滚动（滚动模式下滚动即翻页）
             'stuck_next_js': NEXT_PAGE_JS,
             'page_info_js': PAGE_INFO_JS,
-            'min_blob_size': 30000,   # 过滤UI小图
+            'min_blob_size': 100,     # 捕获的blob全是真实页面(实测最小327B,纯白页680x190)
+                            # 真实页面由提取时的createImageBitmap尺寸校验(>=300px宽)把关,
+                            # 这里仅排除空blob,不能按大小过滤——小尺寸页面会被误杀
             'ready_wait': 8,          # 章节页加载等待秒数
             'page_interval': 0.8,     # 每次翻页间隔秒数
-            'max_stuck': 3,           # 连续翻页无变化的容忍次数
+            'max_stuck': 6,           # 画布点击翻页实测稳定，容忍度可放宽
         },
     }
 
@@ -126,6 +163,12 @@ class BilibiliCrawler:
         self.crawler = crawler
         self.locators = crawler.locators
         self.image_attr = crawler.image_attr
+        # 章节列表缓存：get_chapter_count 与 collect_chapters_images 共用一次Vue提取
+        self._episodes = None
+
+    def _reset_episodes_cache(self):
+        """搜索/切换漫画后清空章节缓存"""
+        self._episodes = None
 
     def get_cover_image(self, target_comic_tab):
         """封面图片URL（明文，可HTTP直下）"""
@@ -152,6 +195,7 @@ class BilibiliCrawler:
 
     def search_comic(self, comic_name, comic_id=None):
         """站内搜索，打开第一个结果的详情页"""
+        self._reset_episodes_cache()
         if comic_id:
             detail_url = f"https://manga.bilibili.com/detail/mc{comic_id}"
             print(f"直接打开详情页: {detail_url}")
@@ -191,15 +235,21 @@ class BilibiliCrawler:
         return target_comic_tab
 
     def get_chapter_count(self, target_comic_tab):
-        """获取章节数"""
+        """获取章节数（取完整Vue章节数据长度，非DOM可见项，可靠且快）"""
         try:
-            chapter_items = target_comic_tab.eles(self.locators['chapter_item'], timeout=15)
-            count = len(chapter_items)
+            episodes = self._ensure_episodes(target_comic_tab)
+            count = len(episodes)
             print(f"检测到 {count} 个章节")
             return count
         except Exception as e:
             print(f"获取章节数失败: {e}")
             return 0
+
+    def _ensure_episodes(self, target_comic_tab):
+        """获取并缓存完整章节列表（Vue组件提取，一次性JS查询）"""
+        if self._episodes is None:
+            self._episodes = self._get_episode_list(target_comic_tab)
+        return self._episodes
 
     def _get_episode_list(self, target_comic_tab):
         """从详情页Vue组件提取完整章节列表
@@ -247,7 +297,7 @@ class BilibiliCrawler:
             print("无法从URL提取comic_id")
             return []
 
-        episodes = self._get_episode_list(target_comic_tab)
+        episodes = self._ensure_episodes(target_comic_tab)
         all_chapters_num = len(episodes)
         print(f"总章节数: {all_chapters_num}")
 

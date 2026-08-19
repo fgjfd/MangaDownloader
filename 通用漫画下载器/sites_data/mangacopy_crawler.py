@@ -182,6 +182,7 @@ class MangacopyCrawler:
                         chapter_tab.close()
                         return {
                             'chapter_num': chapter_num,
+                            'title': chapter_info.get('title', ''),
                             'herf_list': []
                         }
                 else:
@@ -197,6 +198,7 @@ class MangacopyCrawler:
         
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
     
@@ -211,7 +213,10 @@ class MangacopyCrawler:
         chapter_urls = []
         for i, chapter_ele in enumerate(chapter_eles, 1):
             href = chapter_ele.attr('href')
-            chapter_urls.append(href)
+            chapter_urls.append({
+                'url': href,
+                'title': ' '.join((chapter_ele.text or '').split()),
+            })
             print(f"章节{i}: {href}")
         
         if not chapter_urls:
@@ -236,11 +241,16 @@ class MangacopyCrawler:
             
             batch_chapters_info = []
             for num in range(current_chapter, group_end + 1):
-                chapter_url = chapter_urls[num - 1]
-                
+                chapter_url = chapter_urls[num - 1]['url']
+
+                title = chapter_urls[num - 1].get('title', '')
+                if not title:
+                    title = f"第{num}章"
+
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': title,
                     'main_tab': self.crawler.tab
                 })
                 

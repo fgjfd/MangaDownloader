@@ -59,6 +59,20 @@ class BaozimhCrawler:
         target_comic_tab = self.crawler.page.new_tab(href)
         return target_comic_tab
 
+    def _wait_allchapters_ready(self, timeout=15):
+        """等待章节目录页#allchapters元素渲染完成（懒加载，可能晚于导航完成）"""
+        js = "return !!document.getElementById('allchapters');"
+        waited = 0.0
+        while waited < timeout:
+            try:
+                if self.crawler.tab.run_js(js, timeout=5):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+            waited += 0.5
+        return False
+
     def _fetch_chapters_via_api(self, target_comic_tab):
         """用run_js执行fetch请求获取章节列表（无头模式下Alpine.js不渲染DOM，需用API）"""
         try:
@@ -79,7 +93,12 @@ class BaozimhCrawler:
 
             print(f"导航到章节目录页: {chapterlist_url}")
             self.crawler.tab.get(chapterlist_url)
-            time.sleep(2)
+
+            # 等待#allchapters就绪（懒加载竞态：未就绪时run_js立即返回
+            # "allchapters not found"，导致章节数误判为0）
+            if not self._wait_allchapters_ready():
+                print("等待#allchapters元素超时，仍尝试fetch")
+            time.sleep(1)
 
             # 用run_js从#allchapters获取mid，再fetch API获取章节列表
             js_code = """
@@ -108,6 +127,21 @@ class BaozimhCrawler:
             data = body.get('data', {})
             manga_slug = data.get('slug', '')
             chapters = data.get('chapters', [])
+
+            # API偶发只返回部分章节（如默认分页大小）时，重试一次fetch
+            if 0 < len(chapters) < 10:
+                print(f"警告: API仅返回 {len(chapters)} 个章节，疑为部分响应，重试fetch...")
+                time.sleep(1.5)
+                result = self.crawler.tab.run_js(js_code, as_expr=False, timeout=30)
+                if result:
+                    try:
+                        body = json.loads(result)
+                        data = body.get('data', {})
+                        manga_slug = data.get('slug', manga_slug)
+                        chapters = data.get('chapters', chapters)
+                        print(f"重试后API返回 {len(chapters)} 个章节")
+                    except Exception:
+                        pass
 
             # API返回章节已按order从旧到新排列
             chapter_urls = []
@@ -219,6 +253,7 @@ class BaozimhCrawler:
                     chapter_tab.close()
                     return {
                         'chapter_num': chapter_num,
+                        'title': chapter_info.get('title', ''),
                         'herf_list': []
                     }
 
@@ -231,6 +266,7 @@ class BaozimhCrawler:
 
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
 
@@ -269,6 +305,7 @@ class BaozimhCrawler:
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': chapter_urls[num - 1].get('title', ''),
                     'main_tab': self.crawler.tab
                 })
 

@@ -189,6 +189,7 @@ class ManwaCrawler:
                     chapter_tab.close()
                     return {
                         'chapter_num': chapter_num,
+                        'title': chapter_info.get('title', ''),
                         'herf_list': []
                     }
 
@@ -201,6 +202,7 @@ class ManwaCrawler:
 
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list,
             'url': chapter_url
         }
@@ -241,6 +243,7 @@ class ManwaCrawler:
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': chapter_urls[num - 1].get('title', ''),
                     'main_tab': self.crawler.tab
                 })
 

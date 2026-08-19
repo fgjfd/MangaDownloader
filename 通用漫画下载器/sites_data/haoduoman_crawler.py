@@ -21,14 +21,23 @@ class HaoduomanCrawler:
             'search_button': 'xpath:/html/body/header/div[2]/div/div[2]/div/form/div/p[2]/button',
             'search_result': 'xpath:/html/body/main/div/div[2]/div/div[1]/div/div/div[2]/a',
             'cover_image': 'xpath:/html/body/main/div/div[2]/div[1]/div/div/div/div[1]/img',
-            'chapter_list': 'xpath:/html/body/main/div/div[3]/div[2]/ul/li',
-            'chapter_link': 'xpath:/html/body/main/div/div[3]/div[2]/ul/li[num]/a',
-            'chapter_image_parent': 'xpath:/html/body/main/div[1]/div/div[1]/div',
-            'chapter_image_data_original': 'xpath:/html/body/main/div[1]/div/div[1]/div[num]'
+            'chapter_list': 'xpath://ul[contains(@class, "comic-chapters")]/li',
+            'chapter_link': 'xpath://ul[contains(@class, "comic-chapters")]/li[num]/a'
         },
         'image_attr': 'data-original',
         'chapter_group_size': None
     }
+
+    # 章节页图片URL经过加密：页面内联的params密文由站点JS解密后挂到全局params上，
+    # 解密后以blob形式渲染（img的src为blob:，无data-original属性）。
+    # 直接读取解密后的params：真实URL = images_hosts[0] + chapter_images[i]，CDN可直连下载
+    _CHAPTER_IMAGES_JS = """
+    if (typeof params === 'object' && params && Array.isArray(params.chapter_images)) {
+        var host = (params.images_hosts && params.images_hosts[0]) || '';
+        return params.chapter_images.map(function(p) { return host + p; });
+    }
+    return null;
+    """
     def __init__(self, crawler):
         self.crawler = crawler
         self.locators = crawler.locators
@@ -52,25 +61,30 @@ class HaoduomanCrawler:
         chapter_eles = target_comic_tab.eles(self.locators['chapter_list'])
         return len(chapter_eles)
     
-    def get_chapter_image_urls(self, chapter_tab, max_img_num):
-        herf_list = []
+    def get_cover_image(self, target_comic_tab):
+        # 封面img现在直接使用src属性（无data-original懒加载）
+        try:
+            cover_ele = target_comic_tab.ele(self.locators['cover_image'])
+            cover_url = cover_ele.attr('src')
+            if not is_normal_url(cover_url):
+                cover_url = cover_ele.attr(self.image_attr)
+            print(f"封面图片URL: {cover_url}")
+            return cover_url
+        except Exception as e:
+            print(f"获取封面图片失败: {e}")
+            return None
+    
+    def get_chapter_image_urls(self, chapter_tab, max_img_num=None):
+        # 从页面全局的解密params中拼接真实图片URL（host + 相对路径）
+        herf_list = chapter_tab.run_js(self._CHAPTER_IMAGES_JS, timeout=10) or []
         
-        for num in range(1, max_img_num + 1):
-            try:
-                div_xpath = self.locators['chapter_image_data_original'].replace("num", str(num))
-                div_ele = chapter_tab.ele(div_xpath, timeout=3)
-                herf = div_ele.attr(self.image_attr)
-                
-                if is_normal_url(herf):
-                    print(f"第{num}张图片: {herf}")
-                    herf_list.append(herf)
-                else:
-                    print(f"第{num}张图片URL无效: {herf}")
-                    
-            except Exception as e:
-                print(f"获取第{num}张图片时出错: {e}")
+        normal_list = []
+        for herf in herf_list:
+            if is_normal_url(herf):
+                normal_list.append(herf)
         
-        return herf_list
+        print(f"共提取 {len(normal_list)} 张图片")
+        return normal_list
     
     def collect_chapter_images(self, chapter_info, max_wait_time=3):
         chapter_num = chapter_info['chapter_num']
@@ -86,14 +100,14 @@ class HaoduomanCrawler:
             start_time = time.time()
             retry_count = 0
             max_retries = 3
-            max_img_num = 0
+            herf_list = []
             
             while retry_count <= max_retries:
-                img_elements = chapter_tab.eles(self.locators['chapter_image_parent'])
-                max_img_num = len(img_elements)
+                # 等待站点JS完成params解密（解密后全局params含chapter_images数组）
+                herf_list = self.get_chapter_image_urls(chapter_tab)
                 
-                if max_img_num > 0:
-                    print(f"章节{chapter_num}检测到{max_img_num}张图片")
+                if herf_list:
+                    print(f"章节{chapter_num}检测到{len(herf_list)}张图片")
                     break
                 
                 elapsed = time.time() - start_time
@@ -109,12 +123,11 @@ class HaoduomanCrawler:
                         chapter_tab.close()
                         return {
                             'chapter_num': chapter_num,
+                            'title': chapter_info.get('title', ''),
                             'herf_list': []
                         }
                 else:
                     time.sleep(0.5)
-            
-            herf_list = self.get_chapter_image_urls(chapter_tab, max_img_num)
             
             chapter_tab.close()
             
@@ -124,6 +137,7 @@ class HaoduomanCrawler:
         
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
     
@@ -138,6 +152,13 @@ class HaoduomanCrawler:
         first_chapter_ele = target_comic_tab.ele(first_chapter_xpath, timeout=5)
         first_chapter_href = first_chapter_ele.attr("href")
         print(f"第一个章节链接: {first_chapter_href}")
+
+        # 提取章节元素文本作为章节名（li内a的文本，如"第1话 xxx"；缺失时回退）
+        chapter_titles = []
+        for li_ele in chapter_eles:
+            title = ' '.join((li_ele.text or '').split())
+            chapter_titles.append(title)
+        print(f"已提取 {len([t for t in chapter_titles if t])} 个章节名")
         
         actual_start = max(chapter_start, 1)
         actual_end = min(chapter_end, all_chapters_num) if chapter_end > 0 else all_chapters_num
@@ -159,10 +180,15 @@ class HaoduomanCrawler:
             batch_chapters_info = []
             for num in range(current_chapter, group_end + 1):
                 chapter_url = re.sub(r'/\d+\.html$', f'/{num}.html', first_chapter_href)
-                
+
+                title = chapter_titles[num - 1] if num - 1 < len(chapter_titles) else ''
+                if not title:
+                    title = f"第{num}章"
+
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': title,
                     'main_tab': self.crawler.tab
                 })
                 

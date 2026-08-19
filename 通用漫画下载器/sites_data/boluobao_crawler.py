@@ -118,6 +118,7 @@ class BoluobaoCrawler:
         
         return {
             'chapter_num': chapter_num,
+            'title': chapter_info.get('title', ''),
             'herf_list': herf_list
         }
     
@@ -155,10 +156,12 @@ class BoluobaoCrawler:
             for num in range(current_chapter, group_end + 1):
                 idx = num - 1
                 chapter_url = chapter_eles[idx].attr('href')
+                chapter_title = ' '.join((chapter_eles[idx].text or '').split())
                 
                 batch_chapters_info.append({
                     'chapter_num': num,
                     'url': chapter_url,
+                    'title': chapter_title,
                     'main_tab': self.crawler.tab
                 })
                 
