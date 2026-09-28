@@ -24,7 +24,9 @@ class BilibiliCrawler:
     STABLE_CHAPTER_COUNT = True
 
     # 页面加载前注入的钩子：捕获所有createObjectURL产生的blob（解密后的明文图片）
-    # at字段记录捕获时间，供提取时按时间排序（双缓冲预加载可能打乱捕获顺序）
+    # at字段记录捕获时间，供提取时按时间排序（双缓冲预加载可能打乱捕获顺序）；
+    # canvas字段记录捕获瞬间当前画布的DOM位置(x/y)，供双页/从右往左阅读器
+    # 在同一跨页画布内按左右位置重建阅读顺序（右页x大在前）。
     BLOB_HOOK_JS = """
     window.__captured_blobs = window.__captured_blobs || [];
     if (!window.__blob_hook_installed) {
@@ -33,7 +35,13 @@ class BilibiliCrawler:
         URL.createObjectURL = function(obj) {
             var url = __orig_cob(obj);
             if (url.indexOf('blob:') === 0) {
-                window.__captured_blobs.push({url: url, size: obj.size || 0, type: obj.type || '', at: Date.now()});
+                var cv = document.querySelector('canvas');
+                var pos = null;
+                if (cv) {
+                    var r = cv.getBoundingClientRect();
+                    pos = {x: r.x, y: r.y};
+                }
+                window.__captured_blobs.push({url: url, size: obj.size || 0, type: obj.type || '', at: Date.now(), canvas: pos});
             }
             return url;
         };

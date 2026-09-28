@@ -96,7 +96,10 @@ _ACTIVE_IMAGE_EXT = 'jpg'
 # 由GUI/CLI在下载前通过set_active_name_padding设置（持久化于config.json）
 _ACTIVE_NAME_PADDING = 0
 
-# 活跃章节文件夹命名模式：'number'=数字命名(1,2,3...)；'title'=章节名命名(1 第1话 xxx)
+# 活跃章节文件夹命名模式：
+#   'number'     = 数字命名(1,2,3...)
+#   'title'      = 章节名命名(1 第1话 xxx，数字+空格+标题)
+#   'title_only' = 纯标题命名(第1话 xxx，不加数字)
 # 由GUI/CLI在下载前通过set_active_chapter_folder_naming设置（持久化于config.json）
 _ACTIVE_CHAPTER_FOLDER_NAMING = 'number'
 
@@ -111,9 +114,13 @@ def set_active_name_padding(padding):
 
 
 def set_active_chapter_folder_naming(mode):
-    """设置当前下载任务的章节文件夹命名模式（'number'/'title'，传None保持默认数字命名）"""
+    """设置当前下载任务的章节文件夹命名模式
+    （'number'/'title'/'title_only'，未知值回退'number'，传None保持默认数字命名）"""
     global _ACTIVE_CHAPTER_FOLDER_NAMING
-    _ACTIVE_CHAPTER_FOLDER_NAMING = 'title' if mode == 'title' else 'number'
+    if mode in ('title', 'title_only'):
+        _ACTIVE_CHAPTER_FOLDER_NAMING = mode
+    else:
+        _ACTIVE_CHAPTER_FOLDER_NAMING = 'number'
 
 
 def sanitize_folder_name(name):
@@ -130,12 +137,19 @@ def chapter_folder_name(chapter_data):
     - 'number'模式：返回章节号（如 '3'），与原版行为一致
     - 'title'模式：返回 '章节号 章节名'（如 '3 第3话 初次相遇'），
       章节名为空/非法时自动回退为章节号，避免空名或重名冲突
+    - 'title_only'模式：返回纯章节名（如 '第3话 初次相遇'），
+      章节名为空/非法时自动回退为章节号
     """
     num = chapter_data.get('chapter_num', 0)
+    title = sanitize_folder_name(chapter_data.get('title') or '')
     if _ACTIVE_CHAPTER_FOLDER_NAMING == 'title':
-        title = sanitize_folder_name(chapter_data.get('title') or '')
         if title:
             return f"{num} {title}"
+        return str(num)
+    if _ACTIVE_CHAPTER_FOLDER_NAMING == 'title_only':
+        if title:
+            return title
+        return str(num)
     return str(num)
 
 
@@ -599,9 +613,90 @@ def _ensure_tab_foreground(chapter_tab):
         pass
 
 
+def _assign_blob_pages(blobs, page_blob_marks):
+    """把捕获列表中的每个blob归属到页码（按捕获索引与页码区间映射）
+
+    page_blob_marks: [(page, blob_count_after_this_page), ...]，count单调递增。
+    blob在捕获列表中的索引i属于页码p = 第一个满足 i < count 的页码。
+    返回新的blob列表，每个blob带 '_page' 与 '_cap_idx'（捕获列表原始序号，
+    用于页内保持捕获顺序）；无marks时保持原样（_page=0, _cap_idx=0）。
+    """
+    if not page_blob_marks:
+        return blobs
+    result = []
+    for i, b in enumerate(blobs):
+        page = 0
+        for p, c in page_blob_marks:
+            if i < c:
+                page = p
+                break
+        nb = dict(b)
+        nb['_page'] = page
+        nb['_cap_idx'] = i
+        result.append(nb)
+    return result
+
+
+def _blob_x_meaningful(blobs):
+    """判断同页内canvas.x是否可区分左右页（跨度>50px才算有意义）。
+
+    B站双页阅读器实测：canvas为单元素固定位置（querySelector取到第一个canvas），
+    所有blob的x几乎相同（~53.4），此时x无区分度，应回退捕获顺序；
+    仅当某页内x跨度足够大（真·宽画布左右页）才用x排序。
+    """
+    page_xs = {}
+    for b in blobs:
+        p = b.get('_page', 0)
+        cv = b.get('canvas') or {}
+        if p > 0 and cv.get('x') is not None:
+            page_xs.setdefault(p, []).append(cv['x'])
+    return any((max(xs) - min(xs)) > 50 for xs in page_xs.values() if len(xs) >= 2)
+
+
+def _blob_sort_key(b, double_page, use_x):
+    """排序键：双页且x可区分时按(页码, canvas.x从大到小)排（右页在前）；
+    双页但x无区分度时按(页码, 捕获顺序)排（阅读器绘制顺序=阅读顺序）；
+    单页保持捕获时间at顺序（与旧行为一致，防回归）。
+    返回统一三元组，避免tuple/int混排。"""
+    if double_page:
+        page = b.get('_page', 0)
+        if use_x:
+            canvas = b.get('canvas') or {}
+            x = canvas.get('x')
+            if x is not None:
+                return (page, 0, -x)          # 有canvas：同页按x从大到小（右页在前）
+            return (page, 1, b.get('_cap_idx', 0))  # 无canvas：页内按捕获顺序
+        # 双页但x无区分度：按页码分组，页内保持捕获顺序
+        return (page, b.get('_cap_idx', 0))
+    # 单页：忽略页码，纯at顺序（与旧行为完全一致）
+    return (0, 0, b.get('at') or 0)
+
+
+def _detect_double_page(blobs, total_pages):
+    """方向/双页启发式：解码张数≈2×页码总数，且同页存在多个带canvas位置的blob
+    → 判定为双页从右往左阅读器。否则单页，保持at顺序。"""
+    if total_pages <= 0 or len(blobs) < 2 * total_pages - 1:
+        return False
+    page_counts = {}
+    has_canvas = False
+    for b in blobs:
+        p = b.get('_page', 0)
+        if p > 0:
+            page_counts[p] = page_counts.get(p, 0) + 1
+        if (b.get('canvas') or {}).get('x') is not None:
+            has_canvas = True
+    if not has_canvas:
+        return False
+    return any(c >= 2 for c in page_counts.values())
+
+
 def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pages,
-                           progress_callback=None):
+                           progress_callback=None, page_blob_marks=None):
     """提取已捕获的blob并保存，内容MD5去重（双缓冲/预加载会产生重复）
+
+    page_blob_marks: 翻页循环记录的[(页码, 捕获blob数)]，用于把每个blob归属到页码，
+    从而在双页/从右往左阅读器下按"页码+画布内左右位置"重建阅读顺序；
+    单页场景回退为按捕获时间at排序（与旧行为一致）。
 
     Returns:
         (failed, saved_count): 缺失页的失败列表、实际保存张数
@@ -613,16 +708,23 @@ def _blob_extract_and_save(chapter_tab, folder_name, chapter_num, cfg, total_pag
     if not isinstance(blobs, list):
         blobs = []
 
-    # 按URL去重，只保留大图；按捕获时间排序保证页面顺序
-    # （双缓冲/预加载可能提前解码后续页，捕获顺序非严格页码序）
+    # 按URL去重，只保留大图
     seen_urls = set()
     uniq = []
     for b in blobs:
         if b.get('size', 0) >= min_size and b.get('url') and b['url'] not in seen_urls:
             seen_urls.add(b['url'])
             uniq.append(b)
-    uniq.sort(key=lambda b: b.get('at') or 0)
-    print(f"[章节{chapter_num}] 捕获大blob {len(uniq)} 个（总页数 {total_pages}），开始提取...")
+
+    # 归属页码 + 方向判断 + 排序：
+    # 双页从右往左日漫按(页码, -canvas.x)排（右页在前）；x无区分度时页内保持捕获顺序；
+    # 单页保持at顺序防回归
+    uniq = _assign_blob_pages(uniq, page_blob_marks)
+    double_page = _detect_double_page(uniq, total_pages)
+    use_x = _blob_x_meaningful(uniq) if double_page else False
+    uniq.sort(key=lambda b: _blob_sort_key(b, double_page, use_x))
+    print(f"[章节{chapter_num}] 捕获大blob {len(uniq)} 个（总页数 {total_pages}，"
+          f"双页{'是' if double_page else '否'}），开始提取...")
 
     saved_md5 = set()
     idx = 0
@@ -761,6 +863,10 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
                 cur, total = _blob_get_page_info(chapter_tab, page_info_js)
                 stuck = stuck + 1 if cur == prev else 0
 
+            # 记录起始页码的blob区间（第1页），供提取时把blob归属到页码
+            n0 = chapter_tab.run_js('return (window.__captured_blobs || []).length') or 0
+            page_blob_marks = [(cur, n0)]
+
             # 前翻遍历到末页，触发所有页面解密
             # 停滞超过max_stuck次后切换兜底翻页方式并在停滞点持续等待（下一页可能仍在解密），
             # 单点等待超过stuck_timeout秒才放弃，避免点击暂时失效时整章后段缺页
@@ -790,6 +896,9 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
                 else:
                     stuck = 0
                     stuck_waited = 0.0
+                    # 页码变化后记录该页码对应的blob区间（供提取时归属页码）
+                    n = chapter_tab.run_js('return (window.__captured_blobs || []).length') or 0
+                    page_blob_marks.append((cur, n))
 
             # 到底后尾部页面可能仍在异步解码：停在底部持续等待，
             # 直到去重大blob数达到总页数才提前退出，否则等满tail_wait秒
@@ -816,7 +925,8 @@ def _browser_process_chapter_blob(site_crawler, chapter_data, main_folder,
 
             traversal_done = cur >= total
             failed, saved_count = _blob_extract_and_save(
-                chapter_tab, folder_name, chapter_num, cfg, total, progress_callback)
+                chapter_tab, folder_name, chapter_num, cfg, total, progress_callback,
+                page_blob_marks)
 
             if not failed:
                 break

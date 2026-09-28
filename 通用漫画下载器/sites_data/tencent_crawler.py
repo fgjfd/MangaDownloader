@@ -9,8 +9,16 @@ from functools import partial
 CREATE_NO_WINDOW = 0x08000000
 subprocess.Popen = partial(subprocess.Popen, encoding='utf-8', errors='ignore', creationflags=CREATE_NO_WINDOW)
 
-import execjs
 from lxml import etree
+from utils import is_normal_url
+
+# execjs 为可选依赖（仅作为解密兜底）。无 Node/execjs 环境（含打包 exe）时不影响纯Python解密。
+try:
+    import execjs
+    _EXECJS_AVAILABLE = True
+except ImportError:
+    execjs = None
+    _EXECJS_AVAILABLE = False
 
 
 js_code = """
@@ -70,7 +78,49 @@ function Base(data, nonce) {
 }
 """
 
-ctx = execjs.compile(js_code)
+
+def _tencent_decode(data, nonce):
+    """纯Python复现腾讯动漫 Base(data, nonce) 解密算法，无需 execjs/Node 运行时。
+
+    算法（与页面 JS 一致）：
+    1. 按 nonce 的 \\d+[a-zA-Z]+ 段逆序对 DATA 做字符删除(splice)
+    2. base64 解码 + UTF-8
+    3. JSON.parse，返回含 'picture' 的 dict
+    """
+    import base64
+    import json
+
+    # 1. 按 nonce 的 \d+[a-zA-Z]+ 段逆序对 DATA 做字符删除(splice)
+    T = list(data)
+    segments = re.findall(r'\d+[a-zA-Z]+', nonce)
+    for seg in reversed(segments):
+        locate = int(re.match(r'\d+', seg).group()) & 255
+        str_len = len(re.sub(r'\d+', '', seg))
+        # JS splice(locate, str_len)：从 locate 位置删除 str_len 个字符
+        del T[locate:locate + str_len]
+    joined = ''.join(T)
+
+    # 2. base64 解码 + UTF-8（b64decode 默认丢弃非 base64 字符，与 JS 的 replace 一致）
+    decoded = base64.b64decode(joined).decode('utf-8')
+
+    # 3. JSON.parse
+    return json.loads(decoded)
+
+
+def _decrypt_tencent(data, nonce):
+    """解密入口：优先纯Python，失败回退 execjs（可选兜底，execjs 不可用时不影响）。"""
+    try:
+        return _tencent_decode(data, nonce)
+    except Exception as e:
+        print(f"纯Python解密失败，尝试execjs兜底: {e}")
+        if not _EXECJS_AVAILABLE:
+            raise
+        try:
+            ctx = execjs.compile(js_code)
+            return ctx.call("Base", data, nonce)
+        except Exception as e2:
+            print(f"execjs兜底解密也失败: {e2}")
+            raise
 
 
 class TencentCrawler:
@@ -248,28 +298,59 @@ class TencentCrawler:
             
             data = match.group(1)
             print(f"成功提取DATA")
-            
+
+            # 获取 nonce：页面脚本执行后会把 window["n"+"once"]/window["no"+"nce"] 覆盖成随机浮点诱饵，
+            # 因此不能直接读 window 变量。真实 nonce 在 HTML 内联脚本的混淆表达式中，
+            # 用 run_js 在浏览器 JS 引擎里 eval（无需 Node/execjs）。
+            nonce = None
             nonce_script_list = tree.xpath('//script[contains(text(),"window[")]/text()')
-            if len(nonce_script_list) < 2:
-                print("未找到nonce脚本")
+            if len(nonce_script_list) >= 2:
+                nonce_js_code = nonce_script_list[1].strip()
+                print(f"提取的nonce JS代码:\n{nonce_js_code}")
+                pattern = r'window\["[^"]*"\s*\+\s*"[^"]*"\]\s*=\s*(.+?);'
+                m = re.search(pattern, nonce_js_code)
+                if m:
+                    nonce_expr = m.group(1).strip()
+                    # 1) 优先用浏览器 JS 引擎 eval（无 Node 依赖）
+                    try:
+                        val = chapter_tab.run_js(f'return ({nonce_expr})')
+                        if val:
+                            nonce = str(val)
+                    except Exception as e:
+                        print(f"run_js计算nonce失败: {e}")
+                    # 2) 回退 execjs eval（仅当 execjs 可用）
+                    if not nonce and _EXECJS_AVAILABLE:
+                        try:
+                            ctx = execjs.compile(js_code)
+                            nonce = ctx.eval(nonce_expr)
+                        except Exception as e:
+                            print(f"execjs计算nonce失败: {e}")
+
+            # 3) 最后回退：直接读 window 变量（部分页面可能未被覆盖为诱饵）
+            if not nonce:
+                for expr in ('return window["n"+"once"]', 'return window["no"+"nce"]'):
+                    try:
+                        val = chapter_tab.run_js(expr)
+                        if val and re.fullmatch(r'[0-9a-f]+', str(val)):
+                            nonce = str(val)
+                            break
+                    except Exception as e:
+                        print(f"run_js获取nonce失败 ({expr}): {e}")
+
+            if not nonce:
+                print("未找到nonce")
                 return herf_list
-            
-            nonce_js_code = nonce_script_list[1].strip()
-            print(f"提取的nonce JS代码:\n{nonce_js_code}")
-            
-            pattern = r'window\["[^"]*"\s*\+\s*"[^"]*"\]\s*=\s*(.+?);'
-            match = re.search(pattern, nonce_js_code)
-            if match:
-                nonce_expr = match.group(1)
-                nonce = ctx.eval(nonce_expr)
-                print(f"计算后的nonce值: {nonce}")
-                
-                result = ctx.call("Base", data, nonce)
-                urls = [item['url'] for item in result['picture']]
-                print(f"图片URL列表:")
-                for url in urls:
-                    print(url)
-                herf_list = urls
+
+            print(f"计算后的nonce值: {nonce}")
+
+            result = _decrypt_tencent(data, nonce)
+            urls = [item['url'] for item in result['picture']]
+            # 保留 is_normal_url 过滤
+            urls = [u for u in urls if is_normal_url(u)]
+            print(f"图片URL列表:")
+            for url in urls:
+                print(url)
+            herf_list = urls
             
             print(f"\n========== 图片获取完成 ==========")
             print(f"成功获取 {len(herf_list)} 张图片URL")
@@ -302,11 +383,23 @@ class TencentCrawler:
             max_retries = 3
             
             while retry_count <= max_retries:
-                li_eles = chapter_tab.eles(self.locators['chapter_image_parent'])
-                print(f"检测到 {len(li_eles)} 个li标签 (定位器: {self.locators['chapter_image_parent']})")
-                
-                if len(li_eles) > 0:
-                    print(f"章节{chapter_num}检测到{len(li_eles)}个li标签，开始获取图片")
+                # 等待条件改为"页面存在 var DATA 脚本"，与图片来源一致
+                # （懒加载的 li 标签不是图片来源，定位失败会导致误判为空）
+                has_data = False
+                try:
+                    val = chapter_tab.run_js('return typeof window.DATA !== "undefined"')
+                    if val:
+                        has_data = True
+                except Exception:
+                    pass
+                if not has_data:
+                    try:
+                        has_data = 'var DATA =' in chapter_tab.html
+                    except Exception:
+                        has_data = False
+
+                if has_data:
+                    print(f"章节{chapter_num}检测到DATA脚本，开始获取图片")
                     break
                 
                 elapsed = time.time() - start_time

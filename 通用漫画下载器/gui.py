@@ -9,6 +9,7 @@ import asyncio
 import os
 import time
 import json
+import webbrowser
 from crawler import ComicCrawler
 from download_flow import run_download_flow
 from downloader import is_browser_render_site, get_active_proxy
@@ -29,6 +30,7 @@ NAME_PADDING_OPTIONS = [
 CHAPTER_FOLDER_NAMING_OPTIONS = [
     ('数字（1、2、3...）', 'number'),
     ('章节名（1 第1话 标题...）', 'title'),
+    ('纯标题（第1话 标题...）', 'title_only'),
 ]
 
 
@@ -184,9 +186,12 @@ class GenericComicDownloaderGUI:
         self.site_url_label = ttk.Label(
             url_row,
             text="",
-            font=("微软雅黑", 9),
-            foreground="blue"
+            font=("微软雅黑", 9, "underline"),
+            foreground="blue",
+            cursor="hand2"
         )
+        # 点击网址直接打开浏览器跳转（原"复制"按钮保留）
+        self.site_url_label.bind("<Button-1>", self.open_site_url)
         self.site_url_label.pack(side=tk.LEFT)
         ttk.Button(url_row, text="复制", command=self.copy_site_url, width=5).pack(side=tk.LEFT, padx=(4, 0))
 
@@ -456,7 +461,7 @@ class GenericComicDownloaderGUI:
         self.chapter_naming_combo.set(_chapter_naming_to_label(self.chapter_folder_naming_var.get()))
         self.chapter_naming_combo.grid(row=2, column=1, sticky='w', pady=4)
         self.chapter_naming_combo.bind('<<ComboboxSelected>>', self._on_chapter_naming_selected)
-        ttk.Label(img_frame, text="示例：1、2、3 或 1 第1话 xxx（漫画内章节文件夹名）",
+        ttk.Label(img_frame, text="示例：1、2、3 / 1 第1话 xxx / 第1话 xxx（漫画内章节文件夹名）",
                   font=("微软雅黑", 9), foreground="gray").grid(row=3, column=1, sticky='w')
 
         # ---- 窗口设置 ----
@@ -1282,6 +1287,16 @@ class GenericComicDownloaderGUI:
             self.root.clipboard_clear()
             self.root.clipboard_append(url)
             self.append_status(f"已复制网址: {url}")
+
+    def open_site_url(self, event=None):
+        """点击网址直接打开浏览器跳转到当前站点"""
+        url = self.site_url_label.cget("text")
+        if url and url != "（未提供网址）":
+            try:
+                webbrowser.open(url)
+                self.append_status(f"已在浏览器打开: {url}")
+            except Exception as e:
+                self.append_status(f"打开网址失败: {e}")
 
     def _build_site_url_map(self):
         """构建站点名称到网址的映射"""
